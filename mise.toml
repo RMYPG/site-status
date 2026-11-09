@@ -11,11 +11,12 @@ shellcheck = "0.11.0"
 GOTOOLCHAIN = "local"
 
 [tasks.lint]
-description = "Lint the Go code and the GitHub workflows"
+description = "Lint the Go code, the GitHub workflows and the scripts"
 run = [
   "go mod tidy -diff",
   "golangci-lint run",
   "jactionlint",
+  "shellcheck scripts/*.sh",
 ]
 
 [tasks.test]

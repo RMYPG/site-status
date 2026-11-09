@@ -59,22 +59,8 @@ jobs:
           load: true
           tags: site-status:ci
 
-      # Run as production runs it: non-root, read-only root filesystem, no
-      # capabilities. Starting proves the binary is static, because the base has
-      # no libc. Outside a cluster the service must exit on the Kubernetes
-      # client, which also proves it loaded its configuration first.
       - name: Smoke-test the image
-        run: |
-          set -euo pipefail
-          status=0
-          output=$(docker run --rm --read-only --user 65532:65532 --cap-drop ALL \
-            --security-opt no-new-privileges \
-            --volume "$PWD/config.example.json:/etc/site-status/config.json:ro" \
-            --env SITE_STATUS_CONFIG=/etc/site-status/config.json \
-            site-status:ci 2>&1) || status=$?
-          echo "$output"
-          test "$status" -ne 0
-          grep -q 'kubernetes client configuration' <<<"$output"
+        run: bash scripts/smoke-test-image.sh site-status:ci
 
   publish:
     needs: check
@@ -85,18 +71,18 @@ jobs:
       contents: read
       packages: write
     steps:
+      # The whole history, so that the check below can see main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # A release is a commit that reached main. The tag filter above can't say
+      # that, and a tag pushed from a branch would otherwise publish its code.
+      - name: Check the tagged commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Labels the image with org.opencontainers.image.source and .revision,
       # and tags it with the Git tag and no other name.
@@ -106,6 +92,28 @@ jobs:
           images: ghcr.io/rmypg/site-status
           flavor: latest=false
           tags: type=ref,event=tag
+
+      # Loaded to run the smoke test before anything is pushed. The push below
+      # builds from this builder's cache, with the same context and arguments,
+      # so it publishes these layers.
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: site-status:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
+
+      - name: Smoke-test the image
+        run: bash scripts/smoke-test-image.sh site-status:ci
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish the image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
