@@ -52,6 +52,8 @@ type Object struct {
 // rewrites it whenever Ready's status, reason or message changes, and its
 // controllers can pass through Ready=Unknown on every attempt.
 type Episode struct {
+	// UID is the object the stretch belongs to.
+	UID string
 	// Since is when the stretch began.
 	Since time.Time
 	// Failure is the latest Ready=False seen during the stretch, nil while
@@ -59,18 +61,22 @@ type Episode struct {
 	Failure *Condition
 }
 
-// NextEpisode returns the episode after seeing an object's Ready condition at
-// observedAt, or nil if there is none: True ends it. False and Unknown continue
-// it, and a nil ready means the object has no Ready condition yet. An episode
-// that isn't known yet starts at the condition's lastTransitionTime, or at
-// observedAt if the condition has none. The result is always a new value, so
-// callers may share it.
-func NextEpisode(current *Episode, ready *Condition, observedAt time.Time) *Episode {
+// NextEpisode returns the episode after seeing the Ready condition of the object
+// with this UID at observedAt, or nil if there is none: True ends it. False and
+// Unknown continue it, and a nil ready means the object has no Ready condition
+// yet. An episode that isn't known yet, or that belongs to another UID, starts
+// at the condition's lastTransitionTime, or at observedAt if the condition has
+// none: a replacement object must not inherit the old one's timer. The result
+// is always a new value, so callers may share it.
+func NextEpisode(current *Episode, uid string, ready *Condition, observedAt time.Time) *Episode {
 	if ready != nil && ready.Status == "True" {
 		return nil
 	}
+	if current != nil && current.UID != uid {
+		current = nil
+	}
 
-	next := Episode{Since: observedAt}
+	next := Episode{UID: uid, Since: observedAt}
 	switch {
 	case current != nil:
 		next = *current

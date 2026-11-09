@@ -12,6 +12,7 @@ var now = time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 const (
 	imageOld = "ghcr.io/rmypg/fisioindoor:v1.0.2"
 	imageNew = "ghcr.io/rmypg/fisioindoor:v1.0.3"
+	uid      = "object-uid"
 )
 
 // site returns a healthy Site that runs its target, v1.0.2.
@@ -514,7 +515,7 @@ func TestEpisodeAcrossAttempts(t *testing.T) {
 	var episode *Episode
 	for _, step := range steps {
 		at := now.Add(step.at)
-		episode = NextEpisode(episode, ready(step.status, step.at), at)
+		episode = NextEpisode(episode, uid, ready(step.status, step.at), at)
 
 		o := site()
 		behind(&o)
@@ -535,9 +536,9 @@ func TestEpisodeAcrossAttempts(t *testing.T) {
 
 func TestEpisodeOnADiscoveryObjectLeavesThePhaseAlone(t *testing.T) {
 	var episode *Episode
-	episode = NextEpisode(episode, ready("False", 0), now)
-	episode = NextEpisode(episode, ready("Unknown", 5*time.Minute), now.Add(5*time.Minute))
-	episode = NextEpisode(episode, ready("False", 11*time.Minute), now.Add(11*time.Minute))
+	episode = NextEpisode(episode, uid, ready("False", 0), now)
+	episode = NextEpisode(episode, uid, ready("Unknown", 5*time.Minute), now.Add(5*time.Minute))
+	episode = NextEpisode(episode, uid, ready("False", 11*time.Minute), now.Add(11*time.Minute))
 
 	o := site()
 	o.ImageRepository.NotReady = episode
@@ -554,7 +555,7 @@ func TestEpisodeOnADiscoveryObjectLeavesThePhaseAlone(t *testing.T) {
 func TestEpisodeOnlyEverUnknownIsNotAFailure(t *testing.T) {
 	var episode *Episode
 	for _, at := range []time.Duration{0, 5 * time.Minute, 11 * time.Minute, 30 * time.Minute} {
-		episode = NextEpisode(episode, ready("Unknown", at), now.Add(at))
+		episode = NextEpisode(episode, uid, ready("Unknown", at), now.Add(at))
 	}
 
 	o := site()
@@ -569,8 +570,8 @@ func TestEpisodeOnlyEverUnknownIsNotAFailure(t *testing.T) {
 
 func TestEpisodeCountsAtOnceWhenFalseFollowsALongUnknown(t *testing.T) {
 	var episode *Episode
-	episode = NextEpisode(episode, ready("Unknown", 0), now)
-	episode = NextEpisode(episode, ready("False", 11*time.Minute), now.Add(11*time.Minute))
+	episode = NextEpisode(episode, uid, ready("Unknown", 0), now)
+	episode = NextEpisode(episode, uid, ready("False", 11*time.Minute), now.Add(11*time.Minute))
 
 	o := site()
 	behind(&o)
@@ -612,14 +613,14 @@ func TestEpisodeSeeding(t *testing.T) {
 		},
 		{
 			name:        "an existing episode keeps its start",
-			current:     &Episode{Since: now.Add(-time.Hour)},
+			current:     &Episode{UID: uid, Since: now.Add(-time.Hour)},
 			ready:       ready("False", 0),
 			wantSince:   now.Add(-time.Hour),
 			wantFailure: true,
 		},
 		{
 			name:        "Unknown keeps a failure already seen",
-			current:     &Episode{Since: now.Add(-time.Hour), Failure: ready("False", -time.Minute)},
+			current:     &Episode{UID: uid, Since: now.Add(-time.Hour), Failure: ready("False", -time.Minute)},
 			ready:       ready("Unknown", 0),
 			wantSince:   now.Add(-time.Hour),
 			wantFailure: true,
@@ -627,7 +628,7 @@ func TestEpisodeSeeding(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := NextEpisode(tt.current, tt.ready, now)
+			got := NextEpisode(tt.current, uid, tt.ready, now)
 			if got == nil {
 				t.Fatal("NextEpisode = nil, want an episode")
 			}
@@ -644,7 +645,7 @@ func TestEpisodeSeeding(t *testing.T) {
 func TestEpisodeRestartRestartsTheWait(t *testing.T) {
 	// Before the restart the failure had lasted 30 minutes, but Flux had just
 	// rewritten lastTransitionTime, so the new process starts waiting again.
-	episode := NextEpisode(nil, ready("False", -time.Minute), now)
+	episode := NextEpisode(nil, uid, ready("False", -time.Minute), now)
 
 	o := site()
 	behind(&o)
@@ -657,11 +658,24 @@ func TestEpisodeRestartRestartsTheWait(t *testing.T) {
 	}
 }
 
+func TestEpisodeRestartsForAReplacedObject(t *testing.T) {
+	old := NextEpisode(nil, "old-uid", ready("False", -time.Hour), now.Add(-time.Hour))
+
+	got := NextEpisode(old, "new-uid", ready("Unknown", 0), now)
+
+	if got.UID != "new-uid" || !got.Since.Equal(now) {
+		t.Errorf("episode = %+v, want a new one for new-uid starting now", got)
+	}
+	if got.Failure != nil {
+		t.Errorf("Failure = %v, the replacement inherited the old object's failure", got.Failure)
+	}
+}
+
 func TestReadyTrueEndsTheEpisode(t *testing.T) {
-	if got := NextEpisode(&Episode{Since: now, Failure: ready("False", 0)}, ready("True", 0), now); got != nil {
+	if got := NextEpisode(&Episode{UID: uid, Since: now, Failure: ready("False", 0)}, uid, ready("True", 0), now); got != nil {
 		t.Errorf("NextEpisode = %+v, want nil", got)
 	}
-	if got := NextEpisode(nil, ready("True", 0), now); got != nil {
+	if got := NextEpisode(nil, uid, ready("True", 0), now); got != nil {
 		t.Errorf("NextEpisode = %+v, want nil", got)
 	}
 }

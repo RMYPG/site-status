@@ -100,16 +100,21 @@ func (s *server) rollouts(w http.ResponseWriter, r *http.Request) {
 }
 
 // environment resolves the URL's Site and environment. It answers 404 for a
-// name the configuration doesn't hold, and 503 until the watches have synced,
-// because an empty cache says nothing about a Site.
+// name the configuration doesn't hold, and 503 until the watches have synced or
+// while they keep failing: an empty or frozen cache says nothing reliable about
+// a Site.
 func (s *server) environment(w http.ResponseWriter, r *http.Request) (config.Environment, bool) {
 	env, ok := s.cfg.Find(r.PathValue("site"), r.PathValue("environment"))
 	if !ok {
 		s.writeError(w, http.StatusNotFound, "site or environment not found")
 		return config.Environment{}, false
 	}
-	if !s.source.Synced() {
+	switch {
+	case !s.source.Synced():
 		s.writeError(w, http.StatusServiceUnavailable, "watches have not synced yet")
+		return config.Environment{}, false
+	case s.source.WatchFailing():
+		s.writeError(w, http.StatusServiceUnavailable, "watches are failing, so an answer could be stale")
 		return config.Environment{}, false
 	}
 	return env, true

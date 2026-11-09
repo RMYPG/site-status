@@ -1,12 +1,14 @@
 package watch
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	apiwatch "k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -347,74 +350,119 @@ func TestObserveReadsTheFirstContainer(t *testing.T) {
 	}
 }
 
-// kustomizationAt is a Site's Kustomization with one reading of Ready, carrying
-// the fresh lastTransitionTime Flux gives each change.
-func kustomizationAt(status, message string, transition time.Time) *unstructured.Unstructured {
-	return withConditions(object("kustomize.toolkit.fluxcd.io/v1", "Kustomization", FluxNamespace, "fisioindoor"),
+// readyObjectAt is a retrying object with one reading of Ready, carrying the
+// fresh lastTransitionTime Flux gives each change.
+func readyObjectAt(apiVersion, kind, name, status, message string, transition time.Time) *unstructured.Unstructured {
+	return withConditions(object(apiVersion, kind, FluxNamespace, name),
 		map[string]any{"type": "Ready", "status": status, "reason": "Attempt" + status, "message": message, "lastTransitionTime": transition.Format(time.RFC3339)})
 }
 
+func kustomizationAt(status, message string, transition time.Time) *unstructured.Unstructured {
+	return readyObjectAt("kustomize.toolkit.fluxcd.io/v1", "Kustomization", "fisioindoor", status, message, transition)
+}
+
+// TestEpisodeFollowsInformerEvents runs through the informers for each retrying
+// resource, so removing any of them from retrying fails it.
 func TestEpisodeFollowsInformerEvents(t *testing.T) {
+	tests := []struct {
+		kind, apiVersion, name string
+		resource               schema.GroupVersionResource
+		get                    func(rollout.Observation) rollout.Object
+	}{
+		{"ImageRepository", "image.toolkit.fluxcd.io/v1", "fisioindoor", imageRepositories, func(o rollout.Observation) rollout.Object { return o.ImageRepository }},
+		{"ImagePolicy", "image.toolkit.fluxcd.io/v1", "fisioindoor-production", imagePolicies, func(o rollout.Observation) rollout.Object { return o.ImagePolicy }},
+		{"ImageUpdateAutomation", "image.toolkit.fluxcd.io/v1", "image-tags", imageUpdateAutomations, func(o rollout.Observation) rollout.Object { return o.ImageUpdateAutomation }},
+		{"Kustomization", "kustomize.toolkit.fluxcd.io/v1", "fisioindoor", kustomizations, func(o rollout.Observation) rollout.Object { return o.Kustomization }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.kind, func(t *testing.T) {
+			start := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+			cfg := parseConfig(t)
+			env, _ := cfg.Find("fisioindoor", "production")
+			at := func(status, message string, offset time.Duration) *unstructured.Unstructured {
+				return readyObjectAt(tt.apiVersion, tt.kind, tt.name, status, message, start.Add(offset))
+			}
+			client := newClient(at("True", "ready", -time.Hour))
+			watcher := startSynced(t, client, cfg)
+
+			update := func(status, message string, offset time.Duration) {
+				t.Helper()
+				if _, err := client.Resource(tt.resource).Namespace(FluxNamespace).Update(t.Context(), at(status, message, offset), metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitForFailure := func(message string) *rollout.Episode {
+				t.Helper()
+				var episode *rollout.Episode
+				waitFor(t, "failure "+message, func() bool {
+					episode = tt.get(watcher.Observe(env)).NotReady
+					return episode != nil && episode.Failure != nil && episode.Failure.Message == message
+				})
+				return episode
+			}
+
+			if episode := tt.get(watcher.Observe(env)).NotReady; episode != nil {
+				t.Fatalf("Ready=True has episode %+v", episode)
+			}
+
+			// Each change carries a newer lastTransitionTime, but the episode keeps
+			// the first start: Unknown between attempts must not restart the wait.
+			update("False", "attempt 1", 0)
+			waitForFailure("attempt 1")
+			update("Unknown", "in progress", time.Minute)
+			update("False", "attempt 2", 11*time.Minute)
+			if episode := waitForFailure("attempt 2"); !episode.Since.Equal(start) {
+				t.Errorf("Since = %v, want %v", episode.Since, start)
+			}
+
+			update("True", "ready", 12*time.Minute)
+			waitFor(t, "True to clear the episode", func() bool {
+				return tt.get(watcher.Observe(env)).NotReady == nil
+			})
+
+			// A later failure starts a new episode.
+			update("False", "attempt 3", 13*time.Minute)
+			if episode := waitForFailure("attempt 3"); !episode.Since.Equal(start.Add(13 * time.Minute)) {
+				t.Errorf("Since = %v, want a new start", episode.Since)
+			}
+
+			if err := client.Resource(tt.resource).Namespace(FluxNamespace).Delete(t.Context(), tt.name, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "deletion to forget the episode", func() bool {
+				return watcher.episode(tt.resource, FluxNamespace, tt.name) == nil
+			})
+		})
+	}
+}
+
+func TestRecreatedObjectStartsANewEpisode(t *testing.T) {
 	start := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
 	cfg := parseConfig(t)
 	env, _ := cfg.Find("fisioindoor", "production")
-	client := newClient(kustomizationAt("True", "ready", start.Add(-time.Hour)))
+
+	original := kustomizationAt("False", "old", start.Add(-time.Hour))
+	original.SetUID("old-uid")
+	client := newClient(original)
 	watcher := startSynced(t, client, cfg)
 
-	update := func(status, message string, at time.Duration) {
-		t.Helper()
-		if _, err := client.Resource(kustomizations).Namespace(FluxNamespace).Update(t.Context(), kustomizationAt(status, message, start.Add(at)), metav1.UpdateOptions{}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	waitForFailure := func(message string) *rollout.Episode {
-		t.Helper()
-		var episode *rollout.Episode
-		waitFor(t, "failure "+message, func() bool {
-			episode = watcher.Observe(env).Kustomization.NotReady
-			return episode != nil && episode.Failure != nil && episode.Failure.Message == message
-		})
-		return episode
-	}
-
-	if episode := watcher.Observe(env).Kustomization.NotReady; episode != nil {
-		t.Fatalf("Ready=True has episode %+v", episode)
-	}
-
-	// Each change carries a newer lastTransitionTime, but the episode keeps the
-	// first start: Unknown between attempts must not restart the wait.
-	update("False", "attempt 1", 0)
-	waitForFailure("attempt 1")
-	update("Unknown", "in progress", time.Minute)
-	update("False", "attempt 2", 11*time.Minute)
-	episode := waitForFailure("attempt 2")
-
-	if !episode.Since.Equal(start) {
-		t.Errorf("Since = %v, want %v", episode.Since, start)
-	}
-
-	status := rollout.Evaluate(rollout.Observation{Kustomization: rollout.Object{Kind: "Kustomization", Namespace: FluxNamespace, Name: "fisioindoor", Found: true, NotReady: episode}, Target: "v1.0.3"}, start.Add(11*time.Minute))
-	if status.Phase != rollout.PhaseFailed || status.Reason == nil {
-		t.Errorf("status = %+v, want failed with a reason", status)
-	}
-
-	update("True", "ready", 12*time.Minute)
-	waitFor(t, "True to clear the episode", func() bool {
-		return watcher.Observe(env).Kustomization.NotReady == nil
-	})
-
-	// A later failure starts a new episode.
-	update("False", "attempt 3", 13*time.Minute)
-	if episode := waitForFailure("attempt 3"); !episode.Since.Equal(start.Add(13 * time.Minute)) {
-		t.Errorf("Since = %v, want a new start", episode.Since)
-	}
-
-	if err := client.Resource(kustomizations).Namespace(FluxNamespace).Delete(t.Context(), "fisioindoor", metav1.DeleteOptions{}); err != nil {
+	// Deleted and recreated while the watch was disconnected: the relist then
+	// delivers the replacement as an update to the same name.
+	replacement := kustomizationAt("False", "new", start)
+	replacement.SetUID("new-uid")
+	if _, err := client.Resource(kustomizations).Namespace(FluxNamespace).Update(t.Context(), replacement, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "deletion to forget the episode", func() bool {
-		return watcher.episode(kustomizations, FluxNamespace, "fisioindoor") == nil
+
+	var episode *rollout.Episode
+	waitFor(t, "the replacement", func() bool {
+		episode = watcher.Observe(env).Kustomization.NotReady
+		return episode != nil && episode.Failure != nil && episode.Failure.Message == "new"
 	})
+	if episode.UID != "new-uid" || !episode.Since.Equal(start) {
+		t.Errorf("episode = %+v, the replacement inherited the old timer", episode)
+	}
 }
 
 func TestEpisodeSeededFromTheClusterAfterARestart(t *testing.T) {
@@ -491,6 +539,142 @@ func TestRoutineWatchClosesDoNotCount(t *testing.T) {
 	}
 }
 
+// blockingListClient holds one namespace's list of one resource until release
+// closes. A reactor can't do this: the fake runs reactors under its lock, so a
+// blocked one would stop every other list as well.
+type blockingListClient struct {
+	dynamic.Interface
+	resource  schema.GroupVersionResource
+	namespace string
+	release   <-chan struct{}
+}
+
+// IsWatchListSemanticsUnSupported keeps the informers on list and watch, as they
+// are with the fake this wraps, which can't stream an initial list.
+func (c *blockingListClient) IsWatchListSemanticsUnSupported() bool { return true }
+
+func (c *blockingListClient) Resource(resource schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	inner := c.Interface.Resource(resource)
+	if resource != c.resource {
+		return inner
+	}
+	return &blockingResource{NamespaceableResourceInterface: inner, parent: c}
+}
+
+type blockingResource struct {
+	dynamic.NamespaceableResourceInterface
+	parent *blockingListClient
+}
+
+func (r *blockingResource) Namespace(namespace string) dynamic.ResourceInterface {
+	inner := r.NamespaceableResourceInterface.Namespace(namespace)
+	if namespace != r.parent.namespace {
+		return inner
+	}
+	return &blockingList{ResourceInterface: inner, release: r.parent.release}
+}
+
+type blockingList struct {
+	dynamic.ResourceInterface
+	release <-chan struct{}
+}
+
+func (l *blockingList) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	select {
+	case <-l.release:
+		return l.ResourceInterface.List(ctx, opts)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func request(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, http.NoBody))
+	return recorder
+}
+
+// assertAnswering checks /readyz and both API endpoints all answer status.
+func assertAnswering(t *testing.T, h http.Handler, status int) {
+	t.Helper()
+	for _, path := range []string{
+		"/readyz",
+		"/v1/sites/fisioindoor/environments/production",
+		"/v1/sites/fisioindoor/environments/production/rollouts",
+	} {
+		if response := request(t, h, path); response.Code != status {
+			t.Errorf("%s = %d: %s, want %d", path, response.Code, response.Body, status)
+		}
+	}
+}
+
+func TestNotSyncedWhileOneNamespaceListIsBlocked(t *testing.T) {
+	created := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cfg := parseConfig(t)
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(unblock)
+	blocked := informerKey{"vertex-glow", replicaSets}
+	client := &blockingListClient{Interface: newClient(fisioindoorObjects(created)...), resource: replicaSets, namespace: "vertex-glow", release: release}
+
+	watcher := New(client, cfg, time.Now, discardLogger)
+	h := server.New(cfg, watcher, func() time.Time { return created }, discardLogger)
+	watcher.Start(t.Context())
+
+	// Every other informer finishes, so only this list holds readiness back.
+	waitFor(t, "every other informer", func() bool {
+		for key, informer := range watcher.informers {
+			if key != blocked && !informer.Informer().HasSynced() {
+				return false
+			}
+		}
+		return true
+	})
+	if watcher.Synced() {
+		t.Fatal("Synced = true while a site namespace's list is blocked")
+	}
+	assertAnswering(t, h, http.StatusServiceUnavailable)
+
+	unblock()
+	waitFor(t, "the blocked list", watcher.Synced)
+	assertAnswering(t, h, http.StatusOK)
+}
+
+func TestNotSyncedWhileEventHandlersCatchUp(t *testing.T) {
+	created := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cfg := parseConfig(t)
+	env, _ := cfg.Find("fisioindoor", "production")
+	watcher := New(newClient(kustomizationAt("False", "broken", created)), cfg, time.Now, discardLogger)
+	h := server.New(cfg, watcher, func() time.Time { return created }, discardLogger)
+
+	// The event handler takes this lock for each event, so holding it keeps the
+	// handler from finishing the initial list, as a slow handler would.
+	watcher.episodesMu.Lock()
+	unlock := sync.OnceFunc(watcher.episodesMu.Unlock)
+	t.Cleanup(unlock)
+	watcher.Start(t.Context())
+
+	waitFor(t, "every informer", func() bool {
+		for _, informer := range watcher.informers {
+			if !informer.Informer().HasSynced() {
+				return false
+			}
+		}
+		return true
+	})
+	if watcher.Synced() {
+		t.Fatal("Synced = true before the event handler saw the initial list")
+	}
+	assertAnswering(t, h, http.StatusServiceUnavailable)
+
+	unlock()
+	waitFor(t, "the event handler", watcher.Synced)
+	if episode := watcher.Observe(env).Kustomization.NotReady; episode == nil || !episode.Since.Equal(created) {
+		t.Errorf("episode = %+v, want one seeded from the initial list", episode)
+	}
+}
+
 func TestReadinessFailsWhenAWatchBreaksAfterSync(t *testing.T) {
 	cfg := parseConfig(t)
 	client := newClient()
@@ -505,9 +689,8 @@ func TestReadinessFailsWhenAWatchBreaksAfterSync(t *testing.T) {
 	waitFor(t, "the watch error", watcher.WatchFailing)
 
 	h := server.New(cfg, watcher, time.Now, discardLogger)
-	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/readyz", http.NoBody))
-	if recorder.Code != http.StatusServiceUnavailable {
-		t.Errorf("/readyz = %d: %s, want 503", recorder.Code, recorder.Body)
+	assertAnswering(t, h, http.StatusServiceUnavailable)
+	if response := request(t, h, "/healthz"); response.Code != http.StatusOK {
+		t.Errorf("/healthz = %d, want 200", response.Code)
 	}
 }

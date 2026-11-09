@@ -62,9 +62,14 @@ The service authenticates only with its pod's ServiceAccount token, and uses onl
 `get`, `list` and `watch`. It watches each configured namespace separately and
 never lists or watches across the cluster, because its permissions are granted
 per namespace. Anything less than the table below keeps it unready: the first
-list fails and is retried, and `/readyz` answers `503` until it succeeds. A watch
-that breaks later is logged and fails `/readyz` while the errors continue, so the
-pod stops serving from a cache that has stopped following the cluster.
+list fails and is retried, and `/readyz` answers `503` until it succeeds.
+
+A watch that fails later with an error client-go reports, such as Forbidden or a
+timeout, is logged, and `/readyz` and the API answer `503` while those errors
+continue, so the pod stops serving from a cache that has stopped following the
+cluster. client-go retries `connection refused` and 429 when opening a watch
+without reporting them, so those two don't fail `/readyz`: the service keeps
+answering from its cache until the API server is back.
 
 | Resources | Where |
 | --- | --- |

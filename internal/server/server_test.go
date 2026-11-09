@@ -66,7 +66,12 @@ func deployingObservation() rollout.Observation {
 
 func handler(t *testing.T, source Source) http.Handler {
 	t.Helper()
-	return New(testConfig(t), source, func() time.Time { return now }, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return handlerAt(t, source, now)
+}
+
+func handlerAt(t *testing.T, source Source, clock time.Time) http.Handler {
+	t.Helper()
+	return New(testConfig(t), source, func() time.Time { return clock }, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 }
 
 func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
@@ -102,20 +107,40 @@ func TestStatus(t *testing.T) {
 }
 
 func TestStatusUsesTheClock(t *testing.T) {
-	observation := deployingObservation()
-	observation.Kustomization.NotReady = &rollout.Episode{
-		Since:   now.Add(-rollout.Grace - time.Second),
-		Failure: &rollout.Condition{Type: "Ready", Status: "False", Reason: "Broken"},
-	}
-	h := handler(t, &fakeSource{synced: true, observation: observation})
+	// A day ago, so that an episode a minute old at this time is long past the
+	// grace period on the wall clock.
+	clock := time.Now().Add(-24 * time.Hour)
 
-	var body rollout.Status
-	response := get(t, h, "/v1/sites/fisioindoor/environments/production")
-	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name      string
+		age       time.Duration
+		wantPhase rollout.Phase
+		wantNil   bool
+	}{
+		{"inside the grace period at the injected time", time.Minute, rollout.PhaseDeploying, true},
+		{"past the grace period at the injected time", 11 * time.Minute, rollout.PhaseFailed, false},
 	}
-	if body.Phase != rollout.PhaseFailed || body.Reason == nil {
-		t.Errorf("body = %+v, want failed with a reason", body)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			observation := deployingObservation()
+			observation.Kustomization.NotReady = &rollout.Episode{
+				Since:   clock.Add(-tt.age),
+				Failure: &rollout.Condition{Type: "Ready", Status: "False", Reason: "Broken"},
+			}
+			h := handlerAt(t, &fakeSource{synced: true, observation: observation}, clock)
+
+			var body rollout.Status
+			response := get(t, h, "/v1/sites/fisioindoor/environments/production")
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Phase != tt.wantPhase {
+				t.Errorf("phase = %q, want %q", body.Phase, tt.wantPhase)
+			}
+			if (body.Reason == nil) != tt.wantNil {
+				t.Errorf("reason = %v, want null: %v", body.Reason, tt.wantNil)
+			}
+		})
 	}
 }
 
@@ -263,6 +288,29 @@ func TestReadinessWhileWatchesFail(t *testing.T) {
 	assertHeaders(t, response)
 	if got := strings.TrimSpace(response.Body.String()); got != `{"status":"watch failing"}` {
 		t.Errorf("body = %s", got)
+	}
+	if response := get(t, h, "/healthz"); response.Code != http.StatusOK {
+		t.Errorf("/healthz = %d, want 200", response.Code)
+	}
+}
+
+func TestAPIAnswers503WhileWatchesFail(t *testing.T) {
+	h := handler(t, &fakeSource{synced: true, failing: true, observation: deployingObservation()})
+
+	for _, path := range []string{
+		"/v1/sites/fisioindoor/environments/production",
+		"/v1/sites/fisioindoor/environments/production/rollouts",
+	} {
+		response := get(t, h, path)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s = %d, want 503", path, response.Code)
+		}
+		assertHeaders(t, response)
+		assertError(t, response)
+	}
+
+	if response := get(t, h, "/v1/sites/absent/environments/production"); response.Code != http.StatusNotFound {
+		t.Errorf("unknown Site = %d, want 404", response.Code)
 	}
 	if response := get(t, h, "/healthz"); response.Code != http.StatusOK {
 		t.Errorf("/healthz = %d, want 200", response.Code)

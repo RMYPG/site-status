@@ -125,7 +125,7 @@ These limits follow from reading ReplicaSets and storing nothing:
 | `200` | The answer above. | Use it. |
 | `404` | The Site or environment isn't configured, or the path doesn't exist. | Fix the configuration or the request. |
 | `405` | A method other than `GET` or `HEAD`. | Use `GET`. |
-| `503` | The watches have not finished their first sync. | Treat it as no answer and ask again. |
+| `503` | The watches have not finished their first sync, or a watch failed within the last 2 minutes, so an answer could be stale. | Treat it as no answer and ask again. |
 
 A `404` or `503`, like a connection failure, says nothing about the rollout. It
 must not make a Publish `failed`.
@@ -138,3 +138,7 @@ Error bodies are `{ "error": "message" }`.
 | --- | --- |
 | `GET /healthz` | Always `200 {"status":"ok"}`. |
 | `GET /readyz` | `503 {"status":"syncing"}` until every watch has completed its first sync. After that, `503 {"status":"watch failing"}` while watches keep failing (the last failure was under 2 minutes ago), and otherwise `200 {"status":"ok"}`. |
+
+A watch failure here is one client-go reports, such as Forbidden or a timeout.
+client-go retries `connection refused` and 429 when opening a watch without
+reporting them, so those two don't count. `GET /healthz` is unaffected by either.

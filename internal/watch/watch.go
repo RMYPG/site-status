@@ -36,9 +36,11 @@ const (
 	// The rules look at the clock on every request, so nothing needs a periodic
 	// resync: a watch event is the only reason an object changes.
 	noResync = time.Duration(0)
-	// watchErrorWindow is how long one watch failure keeps /readyz failing. The
-	// reflector retries within 30 seconds, so a watch that stays broken renews
-	// it, and a watch that has recovered lets it lapse.
+	// watchErrorWindow is how long one reported watch failure keeps the service
+	// unready. The reflector's retries back off to between 30 and 60 seconds, so
+	// a watch that keeps failing renews it and one that has recovered lets it
+	// lapse. client-go retries connection refused and 429 when opening a watch
+	// without calling the error handler, so those two don't count.
 	watchErrorWindow = 2 * time.Minute
 )
 
@@ -161,8 +163,9 @@ func (w *Watcher) Synced() bool {
 	return true
 }
 
-// WatchFailing reports whether a watch failed within watchErrorWindow, which
-// means the caches may have stopped following the cluster.
+// WatchFailing reports whether client-go reported a watch failure within
+// watchErrorWindow, which means the caches may have stopped following the
+// cluster.
 func (w *Watcher) WatchFailing() bool {
 	last := w.lastWatchError.Load()
 	return last != 0 && w.now().Sub(time.Unix(0, last)) < watchErrorWindow
@@ -191,7 +194,7 @@ func (w *Watcher) trackEpisode(resource schema.GroupVersionResource, object any)
 
 	w.episodesMu.Lock()
 	defer w.episodesMu.Unlock()
-	if next := rollout.NextEpisode(w.episodes[key], ready, w.now()); next != nil {
+	if next := rollout.NextEpisode(w.episodes[key], string(item.GetUID()), ready, w.now()); next != nil {
 		w.episodes[key] = next
 	} else {
 		delete(w.episodes, key)
