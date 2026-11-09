@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -245,6 +246,9 @@ func TestObserveReadsAnEnvironment(t *testing.T) {
 	if observation.ImagePolicy.Conditions[0].LastTransitionTime.IsZero() {
 		t.Error("ImagePolicy condition has no lastTransitionTime")
 	}
+	if observation.Deployment.NotReady != nil || observation.HelmRelease.NotReady != nil {
+		t.Error("an object that doesn't retry on its own has an episode")
+	}
 
 	if len(observation.ReplicaSets) != 2 {
 		t.Fatalf("ReplicaSets = %+v, want the two owned ones", observation.ReplicaSets)
@@ -357,6 +361,11 @@ func readyObjectAt(apiVersion, kind, name, status, message string, transition ti
 		map[string]any{"type": "Ready", "status": status, "reason": "Attempt" + status, "message": message, "lastTransitionTime": transition.Format(time.RFC3339)})
 }
 
+func withUID(u *unstructured.Unstructured, uid string) *unstructured.Unstructured {
+	u.SetUID(types.UID(uid))
+	return u
+}
+
 func kustomizationAt(status, message string, transition time.Time) *unstructured.Unstructured {
 	return readyObjectAt("kustomize.toolkit.fluxcd.io/v1", "Kustomization", "fisioindoor", status, message, transition)
 }
@@ -396,7 +405,7 @@ func TestEpisodeFollowsInformerEvents(t *testing.T) {
 				t.Helper()
 				var episode *rollout.Episode
 				waitFor(t, "failure "+message, func() bool {
-					episode = tt.get(watcher.Observe(env)).NotReady
+					episode = watcher.episode(tt.resource, FluxNamespace, tt.name)
 					return episode != nil && episode.Failure != nil && episode.Failure.Message == message
 				})
 				return episode
@@ -415,10 +424,13 @@ func TestEpisodeFollowsInformerEvents(t *testing.T) {
 			if episode := waitForFailure("attempt 2"); !episode.Since.Equal(start) {
 				t.Errorf("Since = %v, want %v", episode.Since, start)
 			}
+			if observed := tt.get(watcher.Observe(env)).NotReady; observed == nil || !observed.Since.Equal(start) {
+				t.Errorf("Observe's episode = %+v, want the tracked one", observed)
+			}
 
 			update("True", "ready", 12*time.Minute)
 			waitFor(t, "True to clear the episode", func() bool {
-				return tt.get(watcher.Observe(env)).NotReady == nil
+				return watcher.episode(tt.resource, FluxNamespace, tt.name) == nil
 			})
 
 			// A later failure starts a new episode.
@@ -456,12 +468,119 @@ func TestRecreatedObjectStartsANewEpisode(t *testing.T) {
 	}
 
 	var episode *rollout.Episode
-	waitFor(t, "the replacement", func() bool {
-		episode = watcher.Observe(env).Kustomization.NotReady
+	waitFor(t, "the handler to see the replacement", func() bool {
+		episode = watcher.episode(kustomizations, FluxNamespace, "fisioindoor")
 		return episode != nil && episode.Failure != nil && episode.Failure.Message == "new"
 	})
 	if episode.UID != "new-uid" || !episode.Since.Equal(start) {
 		t.Errorf("episode = %+v, the replacement inherited the old timer", episode)
+	}
+	if observed := watcher.Observe(env).Kustomization.NotReady; observed == nil || observed.UID != "new-uid" {
+		t.Errorf("Observe's episode = %+v, want the replacement's", observed)
+	}
+}
+
+// startWithPausableHandler starts a synced watcher and returns a function that
+// pauses its event handler, so that the informer cache moves on without it. It
+// returns a function that resumes the handler.
+func startWithPausableHandler(t *testing.T, client *dynamicfake.FakeDynamicClient, cfg *config.Config) (*Watcher, func() func()) {
+	t.Helper()
+	watcher := New(client, cfg, time.Now, discardLogger)
+	var gate atomic.Pointer[chan struct{}]
+	track := watcher.track
+	watcher.track = func(resource schema.GroupVersionResource, object any) {
+		if wait := gate.Load(); wait != nil {
+			<-*wait
+		}
+		track(resource, object)
+	}
+	watcher.Start(t.Context())
+	waitFor(t, "informers to sync", watcher.Synced)
+
+	return watcher, func() func() {
+		wait := make(chan struct{})
+		gate.Store(&wait)
+		resume := sync.OnceFunc(func() { close(wait) })
+		t.Cleanup(resume)
+		return resume
+	}
+}
+
+func TestCachedObjectIsNotJudgedByALaggingEpisode(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		// The object the handler has seen, and the one only the cache has.
+		before, after *unstructured.Unstructured
+		beforePhase   rollout.Phase
+		wantEpisode   bool
+	}{
+		{
+			name:        "a replacement doesn't inherit the old timer",
+			before:      withUID(kustomizationAt("False", "old", now.Add(-time.Hour)), "old-uid"),
+			after:       withUID(kustomizationAt("False", "new", now), "new-uid"),
+			beforePhase: rollout.PhaseFailed,
+			wantEpisode: true,
+		},
+		{
+			name:        "Ready=True ignores an episode not yet cleared",
+			before:      withUID(kustomizationAt("False", "old", now.Add(-time.Hour)), "same-uid"),
+			after:       withUID(kustomizationAt("True", "new", now), "same-uid"),
+			beforePhase: rollout.PhaseFailed,
+		},
+		{
+			name:        "just turned False, no episode yet",
+			before:      withUID(kustomizationAt("True", "old", now.Add(-time.Hour)), "same-uid"),
+			after:       withUID(kustomizationAt("False", "new", now), "same-uid"),
+			beforePhase: rollout.PhaseDeploying,
+			wantEpisode: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := parseConfig(t)
+			env, _ := cfg.Find("fisioindoor", "production")
+			client := newClient(tt.before)
+			watcher, pause := startWithPausableHandler(t, client, cfg)
+
+			if got := rollout.Evaluate(watcher.Observe(env), now); got.Phase != tt.beforePhase {
+				t.Fatalf("before the change: phase = %q, want %q", got.Phase, tt.beforePhase)
+			}
+			tracked := watcher.episode(kustomizations, FluxNamespace, "fisioindoor")
+			resume := pause()
+
+			if _, err := client.Resource(kustomizations).Namespace(FluxNamespace).Update(t.Context(), tt.after, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "the change to reach the cache", func() bool {
+				list := watcher.Observe(env).Kustomization.Conditions
+				return len(list) == 1 && list[0].Message == "new"
+			})
+			if got := watcher.episode(kustomizations, FluxNamespace, "fisioindoor"); got != tracked {
+				t.Fatalf("tracked episode = %+v, the handler was meant to be paused", got)
+			}
+
+			observation := watcher.Observe(env)
+			if (observation.Kustomization.NotReady != nil) != tt.wantEpisode {
+				t.Errorf("episode = %+v, want one: %v", observation.Kustomization.NotReady, tt.wantEpisode)
+			}
+			got := rollout.Evaluate(observation, now)
+			if got.Phase != rollout.PhaseDeploying {
+				t.Errorf("phase = %q, want deploying", got.Phase)
+			}
+			if got.Reason != nil && strings.Contains(*got.Reason, "Ready=False") {
+				t.Errorf("reason = %q, judged by the earlier version's episode", *got.Reason)
+			}
+
+			resume()
+			waitFor(t, "the handler to catch up", func() bool {
+				return watcher.episode(kustomizations, FluxNamespace, "fisioindoor") != tracked
+			})
+			if got := rollout.Evaluate(watcher.Observe(env), now); got.Phase != rollout.PhaseDeploying {
+				t.Errorf("after the handler caught up: phase = %q, want deploying", got.Phase)
+			}
+		})
 	}
 }
 

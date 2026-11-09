@@ -85,6 +85,8 @@ type Watcher struct {
 	automation    string
 	now           func() time.Time
 	log           *slog.Logger
+	// track handles one informer event. Tests wrap it to delay the handler.
+	track func(schema.GroupVersionResource, any)
 
 	episodesMu sync.RWMutex
 	episodes   map[episodeKey]*rollout.Episode
@@ -102,6 +104,7 @@ func New(client dynamic.Interface, cfg *config.Config, now func() time.Time, log
 		log:        log,
 		episodes:   map[episodeKey]*rollout.Episode{},
 	}
+	w.track = w.trackEpisode
 
 	w.addNamespace(client, FluxNamespace, imageRepositories, imagePolicies, imageUpdateAutomations, kustomizations)
 	seen := map[string]bool{}
@@ -130,8 +133,8 @@ func (w *Watcher) addNamespace(client dynamic.Interface, namespace string, resou
 		})
 		if retrying[resource] {
 			registration, _ := shared.AddEventHandler(cache.ResourceEventHandlerFuncs{
-				AddFunc:    func(object any) { w.trackEpisode(resource, object) },
-				UpdateFunc: func(_, object any) { w.trackEpisode(resource, object) },
+				AddFunc:    func(object any) { w.track(resource, object) },
+				UpdateFunc: func(_, object any) { w.track(resource, object) },
 				DeleteFunc: func(object any) { w.forgetEpisode(resource, object) },
 			})
 			w.registrations = append(w.registrations, registration)
@@ -263,8 +266,26 @@ func (w *Watcher) object(resource schema.GroupVersionResource, kind, namespace, 
 	}
 	object.Found = true
 	object.Conditions = conditions(item)
-	object.NotReady = w.episode(resource, namespace, name)
+	object.NotReady = w.currentEpisode(resource, item, object.Conditions)
 	return item, object
+}
+
+// currentEpisode returns the episode that describes this cached object. The
+// informer updates its cache before it runs the event handler, so the tracked
+// episode can still belong to an earlier version of the object: one with another
+// UID, or one that Ready=True hasn't cleared yet. An object without a matching
+// episode is judged from its own lastTransitionTime, as on seeding.
+func (w *Watcher) currentEpisode(resource schema.GroupVersionResource, item *unstructured.Unstructured, list []rollout.Condition) *rollout.Episode {
+	if !retrying[resource] {
+		return nil
+	}
+	ready := readyCondition(list)
+	uid := string(item.GetUID())
+	tracked := w.episode(resource, item.GetNamespace(), item.GetName())
+	if tracked != nil && tracked.UID == uid && (ready == nil || ready.Status != "True") {
+		return tracked
+	}
+	return rollout.NextEpisode(nil, uid, ready, w.now())
 }
 
 // replicaSetsOf returns the ReplicaSets the Deployment controls, matched by the
