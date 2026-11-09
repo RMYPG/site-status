@@ -1,0 +1,44 @@
+{
+  "imageUpdateAutomation": "image-tags",
+  "sites": [
+    {
+      "id": "edity-sandbox",
+      "environments": {
+        "production": {
+          "namespace": "edity-sandbox",
+          "deployment": "edity-sandbox-sws",
+          "helmRelease": "edity-sandbox",
+          "imagePolicy": "edity-sandbox-production",
+          "imageRepository": "edity-sandbox",
+          "kustomization": "edity-sandbox"
+        }
+      }
+    },
+    {
+      "id": "fisioindoor",
+      "environments": {
+        "production": {
+          "namespace": "fisioindoor",
+          "deployment": "fisioindoor-sws",
+          "helmRelease": "fisioindoor",
+          "imagePolicy": "fisioindoor-production",
+          "imageRepository": "fisioindoor",
+          "kustomization": "fisioindoor"
+        }
+      }
+    },
+    {
+      "id": "vertex-glow",
+      "environments": {
+        "production": {
+          "namespace": "vertex-glow",
+          "deployment": "vertex-glow-sws",
+          "helmRelease": "vertex-glow",
+          "imagePolicy": "vertex-glow-production",
+          "imageRepository": "vertex-glow",
+          "kustomization": "vertex-glow"
+        }
+      }
+    }
+  ]
+}
