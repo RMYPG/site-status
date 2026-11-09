@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-// Grace is how long a Flux object may stay Ready=False before it counts as a
-// failure, measured from the condition's lastTransitionTime. These objects
-// retry on their own, so a shorter failure usually clears up.
+// Grace is how long an object that retries on its own may go without becoming
+// Ready before it counts as a failure, so that a passing error clears up by
+// itself. See Episode for how the time is measured.
 const Grace = 10 * time.Minute
 
 // Phase is where a Site's rollout stands.
@@ -42,6 +42,46 @@ type Object struct {
 	Name       string
 	Found      bool
 	Conditions []Condition
+	// NotReady is the object's current not-Ready episode, nil when there is
+	// none. Only the objects that retry on their own have one.
+	NotReady *Episode
+}
+
+// Episode is one continuous stretch in which an object's Ready condition was
+// not True. The condition's own lastTransitionTime can't measure this: Flux
+// rewrites it whenever Ready's status, reason or message changes, and its
+// controllers can pass through Ready=Unknown on every attempt.
+type Episode struct {
+	// Since is when the stretch began.
+	Since time.Time
+	// Failure is the latest Ready=False seen during the stretch, nil while
+	// Ready has only been Unknown.
+	Failure *Condition
+}
+
+// NextEpisode returns the episode after seeing an object's Ready condition at
+// observedAt, or nil if there is none: True ends it. False and Unknown continue
+// it, and a nil ready means the object has no Ready condition yet. An episode
+// that isn't known yet starts at the condition's lastTransitionTime, or at
+// observedAt if the condition has none. The result is always a new value, so
+// callers may share it.
+func NextEpisode(current *Episode, ready *Condition, observedAt time.Time) *Episode {
+	if ready != nil && ready.Status == "True" {
+		return nil
+	}
+
+	next := Episode{Since: observedAt}
+	switch {
+	case current != nil:
+		next = *current
+	case ready != nil && !ready.LastTransitionTime.IsZero():
+		next.Since = ready.LastTransitionTime
+	}
+	if ready != nil && ready.Status == "False" {
+		failure := *ready
+		next.Failure = &failure
+	}
+	return &next
 }
 
 // ReplicaSet is one ReplicaSet owned by the environment's Deployment.
@@ -107,9 +147,9 @@ func Evaluate(o Observation, now time.Time) Status {
 
 	phase := PhaseDeploying
 	switch {
-	case onTarget && len(unknown) == 0:
+	case onTarget:
 		phase = PhaseLive
-	case !onTarget && len(rollout) > 0:
+	case len(rollout) > 0:
 		phase = PhaseFailed
 	}
 
@@ -192,7 +232,7 @@ func rolloutSignals(o Observation, now time.Time) []string {
 		signals = append(signals, describe(o.HelmRelease, c))
 	}
 	for _, obj := range []Object{o.ImageUpdateAutomation, o.Kustomization} {
-		if c, ok := notReadyPastGrace(obj, now); ok {
+		if c, ok := failingPastGrace(obj, now); ok {
 			signals = append(signals, describe(obj, c))
 		}
 	}
@@ -202,21 +242,24 @@ func rolloutSignals(o Observation, now time.Time) []string {
 func discoverySignals(o Observation, now time.Time) []string {
 	var signals []string
 	for _, obj := range []Object{o.ImageRepository, o.ImagePolicy} {
-		if c, ok := notReadyPastGrace(obj, now); ok {
+		if c, ok := failingPastGrace(obj, now); ok {
 			signals = append(signals, describe(obj, c))
 		}
 	}
 	return signals
 }
 
-// notReadyPastGrace finds a Ready=False older than Grace. A condition without a
-// timestamp can't be shown to have lasted, so it doesn't count.
-func notReadyPastGrace(obj Object, now time.Time) (Condition, bool) {
-	c, ok := find(obj, "Ready")
-	if !ok || c.Status != "False" || c.LastTransitionTime.IsZero() {
+// failingPastGrace returns the latest Ready=False of an object whose not-Ready
+// episode has lasted longer than Grace. The object's current value doesn't
+// matter: an episode that has seen Ready=False keeps counting while Ready is
+// Unknown between attempts, so the phase doesn't flip. An object that was only
+// ever Unknown is not failing.
+func failingPastGrace(obj Object, now time.Time) (Condition, bool) {
+	episode := obj.NotReady
+	if episode == nil || episode.Failure == nil || now.Sub(episode.Since) <= Grace {
 		return Condition{}, false
 	}
-	return c, now.Sub(c.LastTransitionTime) > Grace
+	return *episode.Failure, true
 }
 
 // unknownObjects reports what stops the service from giving a full answer: a

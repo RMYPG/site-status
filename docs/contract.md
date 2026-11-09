@@ -26,19 +26,41 @@ authentication; a NetworkPolicy limits who can reach the port.
 
 ### Phases
 
-- `live`: `running` equals `target`, and every configured object exists.
-- `failed`: `running` differs from `target` while a rollout signal holds.
+- `live`: `running` equals `target`, and both are known.
+- `failed`: not `live`, and a rollout signal holds.
 - `deploying`: anything else.
 
 | Object | Signal | Counts as failed |
 | --- | --- | --- |
 | Deployment | Rollout | `Progressing=False` with reason `ProgressDeadlineExceeded` |
 | HelmRelease | Rollout | `Released=False` |
-| The shared `ImageUpdateAutomation`, the Site's `Kustomization` | Rollout | `Ready=False` for longer than 10 minutes |
-| The Site's `ImageRepository` and `ImagePolicy` | Discovery | `Ready=False` for longer than 10 minutes |
+| The shared `ImageUpdateAutomation`, the Site's `Kustomization` | Rollout | Not Ready for longer than 10 minutes, as below |
+| The Site's `ImageRepository` and `ImagePolicy` | Discovery | Not Ready for longer than 10 minutes, as below |
 
-The 10 minutes are measured from the condition's `lastTransitionTime`. At exactly
-10 minutes a condition does not count yet. `Ready=Unknown` is never a failure.
+These four objects retry on their own, so what counts is a continuous stretch in
+which `Ready` isn't `True`. Flux's `lastTransitionTime` can't measure that: it is
+rewritten whenever `Ready`'s status, reason or message changes, and controllers
+can pass through `Ready=Unknown` on each attempt. The service tracks the stretch
+itself:
+
+- It starts when the service first sees `Ready` not `True`, from the condition's
+  `lastTransitionTime` if it has no record of the object being not Ready.
+- `False` and `Unknown` both continue it, and `True` ends it.
+- The signal counts once the stretch has lasted longer than 10 minutes (exactly
+  10 minutes isn't enough) and `Ready=False` has been seen at least once during it.
+- Once counting, it keeps counting while the current value is `Unknown`, so the
+  phase doesn't flip between attempts.
+- An object that has only ever been `Unknown` is not failing.
+
+The stretch lives in memory, so **a restart restarts the wait**: after a restart
+the service can only seed it from a `lastTransitionTime` that Flux has probably
+just rewritten, so a Site that was already `failed` may report `deploying` again
+for up to 10 minutes.
+
+`Released=False` and `ProgressDeadlineExceeded` have no grace period and are not
+cleared by a new `target`. They stay until a rollout succeeds, so when a Site's
+earlier rollout has failed, the next `target` reports `failed` right away, and
+keeps doing so until a rollout succeeds.
 
 A rollout signal counts only while `running` differs from `target`. A discovery
 signal means `target` has stopped moving, so comparing the two can't show it: it
@@ -51,7 +73,8 @@ rollout signals first.
 ### A Site the service can't fully answer for
 
 A configured Site whose objects don't exist yet, or whose `ImagePolicy` has not
-resolved a tag, gets a normal `200` response. It is never `live`:
+resolved a tag, gets a normal `200` response. It is `live` only if both versions
+are still known and equal:
 
 ```json
 { "target": null, "running": "v1.0.2", "phase": "deploying", "reason": "ImagePolicy flux-system/fisioindoor-production has no resolved tag" }
@@ -63,9 +86,12 @@ resolved a tag, gets a normal `200` response. It is never `live`:
   so a Site with an unknown version isn't `live`.
 - `phase` is `deploying`, or `failed` if a rollout signal holds while the versions
   differ.
-- `reason` names what is missing. It stays `null` when `running` is only null
-  because no ReplicaSet has available replicas, as during a pod's restart: that is
-  a normal moment of a single-replica Site, not a failure.
+- `reason` names what is missing. A missing object that leaves both versions known
+  and equal, such as a `HelmRelease`, goes in `reason` only and the Site stays
+  `live`.
+- `reason` stays `null` when `running` is only null because no ReplicaSet has
+  available replicas, as during a pod's restart: that is a normal moment of a
+  single-replica Site, not a failure.
 
 **For a consumer comparing versions:** treat a `null` `target` or `running` as
 older than every version. Ticket 33's rules then apply unchanged.
@@ -111,4 +137,4 @@ Error bodies are `{ "error": "message" }`.
 | Path | Answers |
 | --- | --- |
 | `GET /healthz` | Always `200 {"status":"ok"}`. |
-| `GET /readyz` | `503 {"status":"syncing"}` until every watch has completed its first sync, then `200 {"status":"ok"}`. |
+| `GET /readyz` | `503 {"status":"syncing"}` until every watch has completed its first sync. After that, `503 {"status":"watch failing"}` while watches keep failing (the last failure was under 2 minutes ago), and otherwise `200 {"status":"ok"}`. |

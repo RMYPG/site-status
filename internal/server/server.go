@@ -15,6 +15,9 @@ import (
 type Source interface {
 	// Synced reports whether every watch has completed its first list.
 	Synced() bool
+	// WatchFailing reports whether watches have failed recently, so that the
+	// cache may have stopped following the cluster.
+	WatchFailing() bool
 	// Observe reads one environment's objects from the cache.
 	Observe(env config.Environment) rollout.Observation
 }
@@ -68,11 +71,14 @@ func (s *server) healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) readyz(w http.ResponseWriter, _ *http.Request) {
-	if !s.source.Synced() {
+	switch {
+	case !s.source.Synced():
 		writeJSON(w, http.StatusServiceUnavailable, statusBody{Status: "syncing"})
-		return
+	case s.source.WatchFailing():
+		writeJSON(w, http.StatusServiceUnavailable, statusBody{Status: "watch failing"})
+	default:
+		writeJSON(w, http.StatusOK, statusBody{Status: "ok"})
 	}
-	writeJSON(w, http.StatusOK, statusBody{Status: "ok"})
 }
 
 func (s *server) status(w http.ResponseWriter, r *http.Request) {

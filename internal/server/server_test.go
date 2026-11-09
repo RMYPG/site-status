@@ -18,10 +18,13 @@ var now = time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 
 type fakeSource struct {
 	synced      bool
+	failing     bool
 	observation rollout.Observation
 }
 
 func (f *fakeSource) Synced() bool { return f.synced }
+
+func (f *fakeSource) WatchFailing() bool { return f.failing }
 
 func (f *fakeSource) Observe(config.Environment) rollout.Observation { return f.observation }
 
@@ -100,8 +103,9 @@ func TestStatus(t *testing.T) {
 
 func TestStatusUsesTheClock(t *testing.T) {
 	observation := deployingObservation()
-	observation.Kustomization.Conditions = []rollout.Condition{
-		{Type: "Ready", Status: "False", Reason: "Broken", LastTransitionTime: now.Add(-rollout.Grace - time.Second)},
+	observation.Kustomization.NotReady = &rollout.Episode{
+		Since:   now.Add(-rollout.Grace - time.Second),
+		Failure: &rollout.Condition{Type: "Ready", Status: "False", Reason: "Broken"},
 	}
 	h := handler(t, &fakeSource{synced: true, observation: observation})
 
@@ -118,8 +122,9 @@ func TestStatusUsesTheClock(t *testing.T) {
 func TestReasonWhileLive(t *testing.T) {
 	observation := deployingObservation()
 	observation.Target = "v1.0.2"
-	observation.ImageRepository.Conditions = []rollout.Condition{
-		{Type: "Ready", Status: "False", Reason: "ScanFailed", Message: "registry down", LastTransitionTime: now.Add(-time.Hour)},
+	observation.ImageRepository.NotReady = &rollout.Episode{
+		Since:   now.Add(-time.Hour),
+		Failure: &rollout.Condition{Type: "Ready", Status: "False", Reason: "ScanFailed", Message: "registry down"},
 	}
 	h := handler(t, &fakeSource{synced: true, observation: observation})
 
@@ -245,6 +250,22 @@ func TestReadinessBeforeSync(t *testing.T) {
 		}
 		assertHeaders(t, response)
 		assertError(t, response)
+	}
+}
+
+func TestReadinessWhileWatchesFail(t *testing.T) {
+	h := handler(t, &fakeSource{synced: true, failing: true, observation: deployingObservation()})
+
+	response := get(t, h, "/readyz")
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("/readyz = %d, want 503", response.Code)
+	}
+	assertHeaders(t, response)
+	if got := strings.TrimSpace(response.Body.String()); got != `{"status":"watch failing"}` {
+		t.Errorf("body = %s", got)
+	}
+	if response := get(t, h, "/healthz"); response.Code != http.StatusOK {
+		t.Errorf("/healthz = %d, want 200", response.Code)
 	}
 }
 

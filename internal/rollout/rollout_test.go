@@ -42,6 +42,13 @@ func notReady(age time.Duration, reason string) Condition {
 	return Condition{Type: "Ready", Status: "False", Reason: reason, Message: "it broke", LastTransitionTime: now.Add(-age)}
 }
 
+// failing gives obj a not-Ready episode of the given age that has seen
+// Ready=False.
+func failing(obj *Object, age time.Duration, reason string) {
+	failure := notReady(age, reason)
+	obj.NotReady = &Episode{Since: now.Add(-age), Failure: &failure}
+}
+
 // signal replaces obj's conditions.
 func signal(obj *Object, conditions ...Condition) {
 	obj.Conditions = conditions
@@ -108,7 +115,7 @@ func TestEvaluate(t *testing.T) {
 			name: "ImageUpdateAutomation not ready past the grace period",
 			mut: func(o *Observation) {
 				behind(o)
-				signal(&o.ImageUpdateAutomation, notReady(11*time.Minute, "PushFailed"))
+				failing(&o.ImageUpdateAutomation, 11*time.Minute, "PushFailed")
 			},
 			wantTarget:  "v1.0.3",
 			wantRunning: "v1.0.2",
@@ -119,7 +126,7 @@ func TestEvaluate(t *testing.T) {
 			name: "Kustomization not ready past the grace period",
 			mut: func(o *Observation) {
 				behind(o)
-				signal(&o.Kustomization, notReady(11*time.Minute, "HealthCheckFailed"))
+				failing(&o.Kustomization, 11*time.Minute, "HealthCheckFailed")
 			},
 			wantTarget:  "v1.0.3",
 			wantRunning: "v1.0.2",
@@ -170,8 +177,8 @@ func TestEvaluate(t *testing.T) {
 			name: "Ready=Unknown past the grace period on a Flux object is not a failure",
 			mut: func(o *Observation) {
 				behind(o)
-				signal(&o.Kustomization, Condition{Type: "Ready", Status: "Unknown", Reason: "Progressing", LastTransitionTime: now.Add(-time.Hour)})
-				signal(&o.ImageRepository, Condition{Type: "Ready", Status: "Unknown", Reason: "Progressing", LastTransitionTime: now.Add(-time.Hour)})
+				o.Kustomization.NotReady = &Episode{Since: now.Add(-time.Hour)}
+				o.ImageRepository.NotReady = &Episode{Since: now.Add(-time.Hour)}
 			},
 			wantTarget:  "v1.0.3",
 			wantRunning: "v1.0.2",
@@ -182,7 +189,7 @@ func TestEvaluate(t *testing.T) {
 		{
 			name: "ImageRepository scan failing on a live Site",
 			mut: func(o *Observation) {
-				signal(&o.ImageRepository, notReady(11*time.Minute, "ScanFailed"))
+				failing(&o.ImageRepository, 11*time.Minute, "ScanFailed")
 			},
 			wantTarget:  "v1.0.2",
 			wantRunning: "v1.0.2",
@@ -192,7 +199,7 @@ func TestEvaluate(t *testing.T) {
 		{
 			name: "ImagePolicy failing on a live Site",
 			mut: func(o *Observation) {
-				signal(&o.ImagePolicy, notReady(11*time.Minute, "PolicyFailed"))
+				failing(&o.ImagePolicy, 11*time.Minute, "PolicyFailed")
 			},
 			wantTarget:  "v1.0.2",
 			wantRunning: "v1.0.2",
@@ -203,7 +210,7 @@ func TestEvaluate(t *testing.T) {
 			name: "a discovery signal while deploying stays deploying",
 			mut: func(o *Observation) {
 				behind(o)
-				signal(&o.ImageRepository, notReady(11*time.Minute, "ScanFailed"))
+				failing(&o.ImageRepository, 11*time.Minute, "ScanFailed")
 			},
 			wantTarget:  "v1.0.3",
 			wantRunning: "v1.0.2",
@@ -215,7 +222,7 @@ func TestEvaluate(t *testing.T) {
 			mut: func(o *Observation) {
 				behind(o)
 				signal(&o.Deployment, Condition{Type: "Progressing", Status: "False", Reason: "ProgressDeadlineExceeded"})
-				signal(&o.ImagePolicy, notReady(11*time.Minute, "PolicyFailed"))
+				failing(&o.ImagePolicy, 11*time.Minute, "PolicyFailed")
 			},
 			wantTarget:  "v1.0.3",
 			wantRunning: "v1.0.2",
@@ -254,13 +261,13 @@ func TestEvaluate(t *testing.T) {
 			wantReason: "Deployment fisioindoor/fisioindoor-sws not found",
 		},
 		{
-			name: "a missing object stops a Site on target from being live",
+			name: "a missing object is only a reason on a Site on target",
 			mut: func(o *Observation) {
 				o.HelmRelease.Found = false
 			},
 			wantTarget:  "v1.0.2",
 			wantRunning: "v1.0.2",
-			wantPhase:   PhaseDeploying,
+			wantPhase:   PhaseLive,
 			wantReason:  "HelmRelease fisioindoor/fisioindoor not found",
 		},
 		{
@@ -271,7 +278,7 @@ func TestEvaluate(t *testing.T) {
 			},
 			wantTarget:  "v1.0.2",
 			wantRunning: "v1.0.2",
-			wantPhase:   PhaseDeploying,
+			wantPhase:   PhaseLive,
 			wantReason:  "HelmRelease fisioindoor/fisioindoor not found",
 		},
 		{
@@ -297,6 +304,16 @@ func TestEvaluate(t *testing.T) {
 			},
 			wantPhase:  PhaseDeploying,
 			wantReason: "no resolved tag",
+		},
+		{
+			name: "both versions null and a rollout signal is failed",
+			mut: func(o *Observation) {
+				o.Target = ""
+				o.ReplicaSets = nil
+				signal(&o.HelmRelease, Condition{Type: "Released", Status: "False", Reason: "UpgradeFailed"})
+			},
+			wantPhase:  PhaseFailed,
+			wantReason: "HelmRelease fisioindoor/fisioindoor: Released=False (UpgradeFailed); ImagePolicy flux-system/fisioindoor-production has no resolved tag",
 		},
 		{
 			name: "no ReplicaSet has available replicas, as during a pod restart",
@@ -408,14 +425,17 @@ func TestGracePeriod(t *testing.T) {
 		{"ImageRepository", func(o *Observation) *Object { return &o.ImageRepository }, false},
 		{"ImagePolicy", func(o *Observation) *Object { return &o.ImagePolicy }, false},
 	}
+	// Literal durations, so that changing Grace fails this test.
 	ages := []struct {
 		name  string
 		age   time.Duration
 		count bool
 	}{
-		{"just under", Grace - time.Second, false},
-		{"exactly at", Grace, false},
-		{"just over", Grace + time.Second, true},
+		{"9m", 9 * time.Minute, false},
+		{"just under 10m", 10*time.Minute - time.Second, false},
+		{"exactly 10m", 10 * time.Minute, false},
+		{"just over 10m", 10*time.Minute + time.Second, true},
+		{"10m30s", 10*time.Minute + 30*time.Second, true},
 	}
 
 	for _, obj := range objects {
@@ -423,7 +443,7 @@ func TestGracePeriod(t *testing.T) {
 			t.Run(obj.name+"/"+age.name, func(t *testing.T) {
 				o := site()
 				behind(&o)
-				signal(obj.get(&o), notReady(age.age, "Broken"))
+				failing(obj.get(&o), age.age, "Broken")
 
 				got := Evaluate(o, now)
 
@@ -445,10 +465,10 @@ func TestGracePeriod(t *testing.T) {
 	}
 }
 
-func TestGracePeriodMeasuresFromLastTransitionTime(t *testing.T) {
+func TestGracePeriodMeasuresFromTheStartOfTheEpisode(t *testing.T) {
 	o := site()
 	behind(&o)
-	signal(&o.Kustomization, notReady(5*time.Minute, "Broken"))
+	failing(&o.Kustomization, 5*time.Minute, "Broken")
 
 	if got := Evaluate(o, now); got.Phase != PhaseDeploying {
 		t.Fatalf("at 5 minutes: phase = %q, want deploying", got.Phase)
@@ -458,14 +478,191 @@ func TestGracePeriodMeasuresFromLastTransitionTime(t *testing.T) {
 	}
 }
 
-func TestConditionWithoutTimestampDoesNotCount(t *testing.T) {
+// ready is one reading of a Ready condition, with the fresh lastTransitionTime
+// Flux gives it on each change.
+func ready(status string, at time.Duration) *Condition {
+	return &Condition{Type: "Ready", Status: status, Reason: "Attempt" + status, Message: "attempt", LastTransitionTime: now.Add(at)}
+}
+
+func TestEpisodeAcrossAttempts(t *testing.T) {
+	// A Kustomization whose every attempt flips Ready, as kustomize-controller
+	// does: each reading carries a lastTransitionTime no older than itself.
+	steps := []struct {
+		at         time.Duration
+		status     string
+		wantPhase  Phase
+		wantReason string
+	}{
+		{0, "False", PhaseDeploying, ""},
+		{time.Minute, "Unknown", PhaseDeploying, ""},
+		{2 * time.Minute, "False", PhaseDeploying, ""},
+		{3 * time.Minute, "Unknown", PhaseDeploying, ""},
+		{9 * time.Minute, "False", PhaseDeploying, ""},
+		{10 * time.Minute, "Unknown", PhaseDeploying, ""},
+		{10*time.Minute + 30*time.Second, "False", PhaseFailed, "Kustomization flux-system/fisioindoor: Ready=False (AttemptFalse): attempt"},
+		// Between attempts the current value is Unknown: the phase must not flip.
+		{11 * time.Minute, "Unknown", PhaseFailed, "Kustomization flux-system/fisioindoor: Ready=False (AttemptFalse)"},
+		{12 * time.Minute, "False", PhaseFailed, "AttemptFalse"},
+		// True ends the episode.
+		{13 * time.Minute, "True", PhaseDeploying, ""},
+		// The next failure starts a new wait.
+		{14 * time.Minute, "False", PhaseDeploying, ""},
+		{20 * time.Minute, "False", PhaseDeploying, ""},
+		{25 * time.Minute, "False", PhaseFailed, "AttemptFalse"},
+	}
+
+	var episode *Episode
+	for _, step := range steps {
+		at := now.Add(step.at)
+		episode = NextEpisode(episode, ready(step.status, step.at), at)
+
+		o := site()
+		behind(&o)
+		o.Kustomization.NotReady = episode
+
+		got := Evaluate(o, at)
+		if got.Phase != step.wantPhase {
+			t.Errorf("at %s (%s): phase = %q, want %q", step.at, step.status, got.Phase, step.wantPhase)
+		}
+		switch {
+		case step.wantReason == "" && got.Reason != nil:
+			t.Errorf("at %s (%s): reason = %q, want null", step.at, step.status, *got.Reason)
+		case step.wantReason != "" && (got.Reason == nil || !strings.Contains(*got.Reason, step.wantReason)):
+			t.Errorf("at %s (%s): reason = %v, want it to contain %q", step.at, step.status, got.Reason, step.wantReason)
+		}
+	}
+}
+
+func TestEpisodeOnADiscoveryObjectLeavesThePhaseAlone(t *testing.T) {
+	var episode *Episode
+	episode = NextEpisode(episode, ready("False", 0), now)
+	episode = NextEpisode(episode, ready("Unknown", 5*time.Minute), now.Add(5*time.Minute))
+	episode = NextEpisode(episode, ready("False", 11*time.Minute), now.Add(11*time.Minute))
+
+	o := site()
+	o.ImageRepository.NotReady = episode
+	got := Evaluate(o, now.Add(11*time.Minute))
+
+	if got.Phase != PhaseLive {
+		t.Errorf("phase = %q, want live", got.Phase)
+	}
+	if got.Reason == nil || !strings.Contains(*got.Reason, "ImageRepository") {
+		t.Errorf("reason = %v, want the scan failure", got.Reason)
+	}
+}
+
+func TestEpisodeOnlyEverUnknownIsNotAFailure(t *testing.T) {
+	var episode *Episode
+	for _, at := range []time.Duration{0, 5 * time.Minute, 11 * time.Minute, 30 * time.Minute} {
+		episode = NextEpisode(episode, ready("Unknown", at), now.Add(at))
+	}
+
 	o := site()
 	behind(&o)
-	signal(&o.Kustomization, Condition{Type: "Ready", Status: "False", Reason: "Broken"})
+	o.Kustomization.NotReady = episode
+	got := Evaluate(o, now.Add(30*time.Minute))
 
-	got := Evaluate(o, now)
 	if got.Phase != PhaseDeploying || got.Reason != nil {
 		t.Errorf("got phase %q reason %v, want deploying and null", got.Phase, got.Reason)
+	}
+}
+
+func TestEpisodeCountsAtOnceWhenFalseFollowsALongUnknown(t *testing.T) {
+	var episode *Episode
+	episode = NextEpisode(episode, ready("Unknown", 0), now)
+	episode = NextEpisode(episode, ready("False", 11*time.Minute), now.Add(11*time.Minute))
+
+	o := site()
+	behind(&o)
+	o.Kustomization.NotReady = episode
+	if got := Evaluate(o, now.Add(11*time.Minute)); got.Phase != PhaseFailed {
+		t.Errorf("phase = %q, want failed", got.Phase)
+	}
+}
+
+func TestEpisodeSeeding(t *testing.T) {
+	tests := []struct {
+		name        string
+		current     *Episode
+		ready       *Condition
+		wantSince   time.Time
+		wantFailure bool
+	}{
+		{
+			name:        "no episode known: False seeds from lastTransitionTime, as after a restart",
+			ready:       ready("False", -20*time.Minute),
+			wantSince:   now.Add(-20 * time.Minute),
+			wantFailure: true,
+		},
+		{
+			name:      "no episode known: Unknown seeds from lastTransitionTime, no failure yet",
+			ready:     ready("Unknown", -time.Minute),
+			wantSince: now.Add(-time.Minute),
+		},
+		{
+			name:        "no lastTransitionTime: starts at the observation",
+			ready:       &Condition{Type: "Ready", Status: "False"},
+			wantSince:   now,
+			wantFailure: true,
+		},
+		{
+			name:      "no Ready condition yet: starts at the observation",
+			ready:     nil,
+			wantSince: now,
+		},
+		{
+			name:        "an existing episode keeps its start",
+			current:     &Episode{Since: now.Add(-time.Hour)},
+			ready:       ready("False", 0),
+			wantSince:   now.Add(-time.Hour),
+			wantFailure: true,
+		},
+		{
+			name:        "Unknown keeps a failure already seen",
+			current:     &Episode{Since: now.Add(-time.Hour), Failure: ready("False", -time.Minute)},
+			ready:       ready("Unknown", 0),
+			wantSince:   now.Add(-time.Hour),
+			wantFailure: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NextEpisode(tt.current, tt.ready, now)
+			if got == nil {
+				t.Fatal("NextEpisode = nil, want an episode")
+			}
+			if !got.Since.Equal(tt.wantSince) {
+				t.Errorf("Since = %v, want %v", got.Since, tt.wantSince)
+			}
+			if (got.Failure != nil) != tt.wantFailure {
+				t.Errorf("Failure = %v, want set: %v", got.Failure, tt.wantFailure)
+			}
+		})
+	}
+}
+
+func TestEpisodeRestartRestartsTheWait(t *testing.T) {
+	// Before the restart the failure had lasted 30 minutes, but Flux had just
+	// rewritten lastTransitionTime, so the new process starts waiting again.
+	episode := NextEpisode(nil, ready("False", -time.Minute), now)
+
+	o := site()
+	behind(&o)
+	o.Kustomization.NotReady = episode
+	if got := Evaluate(o, now); got.Phase != PhaseDeploying {
+		t.Errorf("right after the restart: phase = %q, want deploying", got.Phase)
+	}
+	if got := Evaluate(o, now.Add(10*time.Minute)); got.Phase != PhaseFailed {
+		t.Errorf("11 minutes after the seed: phase = %q, want failed", got.Phase)
+	}
+}
+
+func TestReadyTrueEndsTheEpisode(t *testing.T) {
+	if got := NextEpisode(&Episode{Since: now, Failure: ready("False", 0)}, ready("True", 0), now); got != nil {
+		t.Errorf("NextEpisode = %+v, want nil", got)
+	}
+	if got := NextEpisode(nil, ready("True", 0), now); got != nil {
+		t.Errorf("NextEpisode = %+v, want nil", got)
 	}
 }
 
@@ -481,10 +678,10 @@ func TestRolloutSignalIgnoredWhenRunningEqualsTarget(t *testing.T) {
 			signal(&o.HelmRelease, Condition{Type: "Released", Status: "False", Reason: "UpgradeFailed"})
 		}},
 		{"ImageUpdateAutomation", func(o *Observation) {
-			signal(&o.ImageUpdateAutomation, notReady(time.Hour, "PushFailed"))
+			failing(&o.ImageUpdateAutomation, time.Hour, "PushFailed")
 		}},
 		{"Kustomization", func(o *Observation) {
-			signal(&o.Kustomization, notReady(time.Hour, "HealthCheckFailed"))
+			failing(&o.Kustomization, time.Hour, "HealthCheckFailed")
 		}},
 	}
 	for _, s := range signals {

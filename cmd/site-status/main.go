@@ -74,7 +74,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, logger 
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
 
-	watcher := watch.New(client, cfg)
+	watcher := watch.New(client, cfg, time.Now, logger)
 	watcher.Start(ctx)
 
 	httpServer := &http.Server{

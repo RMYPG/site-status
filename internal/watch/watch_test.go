@@ -2,21 +2,25 @@ package watch
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RMYPG/site-status/internal/config"
 	"github.com/RMYPG/site-status/internal/rollout"
 	"github.com/RMYPG/site-status/internal/server"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	apiwatch "k8s.io/apimachinery/pkg/watch"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -34,6 +38,8 @@ const testConfig = `{
 		}}}
 	]
 }`
+
+var discardLogger = slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 var listKinds = map[schema.GroupVersionResource]string{
 	deployments:            "DeploymentList",
@@ -123,7 +129,7 @@ func fisioindoorObjects(created time.Time) []runtime.Object {
 
 func startSynced(t *testing.T, client *dynamicfake.FakeDynamicClient, cfg *config.Config) *Watcher {
 	t.Helper()
-	watcher := New(client, cfg)
+	watcher := New(client, cfg, time.Now, discardLogger)
 	watcher.Start(t.Context())
 	waitFor(t, "informers to sync", watcher.Synced)
 	return watcher
@@ -286,8 +292,8 @@ func TestDropManagedFields(t *testing.T) {
 func TestServerAgainstARealWatcher(t *testing.T) {
 	created := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
 	cfg := parseConfig(t)
-	watcher := New(newClient(fisioindoorObjects(created)...), cfg)
-	h := server.New(cfg, watcher, func() time.Time { return created }, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	watcher := New(newClient(fisioindoorObjects(created)...), cfg, time.Now, discardLogger)
+	h := server.New(cfg, watcher, func() time.Time { return created }, discardLogger)
 
 	get := func(path string) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
@@ -312,5 +318,196 @@ func TestServerAgainstARealWatcher(t *testing.T) {
 	}
 	if body.Target == nil || *body.Target != "v1.0.3" || body.Running == nil || *body.Running != "v1.0.2" || body.Phase != rollout.PhaseDeploying || body.Reason != nil {
 		t.Errorf("body = %+v", body)
+	}
+}
+
+func TestObserveReadsTheFirstContainer(t *testing.T) {
+	created := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cfg := parseConfig(t)
+
+	deployment := object("apps/v1", "Deployment", "fisioindoor", "fisioindoor-sws")
+	deployment.SetUID("deployment-uid")
+	rs := replicaSet("fisioindoor", "two-containers", "ghcr.io/rmypg/fisioindoor:v1.0.2", "deployment-uid", created, 1)
+	if err := unstructured.SetNestedSlice(rs.Object, []any{
+		map[string]any{"name": "sws", "image": "ghcr.io/rmypg/fisioindoor:v1.0.2"},
+		map[string]any{"name": "sidecar", "image": "ghcr.io/rmypg/sidecar:v9.9.9"},
+	}, "spec", "template", "spec", "containers"); err != nil {
+		t.Fatal(err)
+	}
+
+	watcher := startSynced(t, newClient(deployment, rs), cfg)
+	env, _ := cfg.Find("fisioindoor", "production")
+	got := watcher.Observe(env).ReplicaSets
+
+	if len(got) != 1 {
+		t.Fatalf("ReplicaSets = %+v, want one", got)
+	}
+	if got[0].Image != "ghcr.io/rmypg/fisioindoor:v1.0.2" {
+		t.Errorf("Image = %q, want the first container's", got[0].Image)
+	}
+}
+
+// kustomizationAt is a Site's Kustomization with one reading of Ready, carrying
+// the fresh lastTransitionTime Flux gives each change.
+func kustomizationAt(status, message string, transition time.Time) *unstructured.Unstructured {
+	return withConditions(object("kustomize.toolkit.fluxcd.io/v1", "Kustomization", FluxNamespace, "fisioindoor"),
+		map[string]any{"type": "Ready", "status": status, "reason": "Attempt" + status, "message": message, "lastTransitionTime": transition.Format(time.RFC3339)})
+}
+
+func TestEpisodeFollowsInformerEvents(t *testing.T) {
+	start := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cfg := parseConfig(t)
+	env, _ := cfg.Find("fisioindoor", "production")
+	client := newClient(kustomizationAt("True", "ready", start.Add(-time.Hour)))
+	watcher := startSynced(t, client, cfg)
+
+	update := func(status, message string, at time.Duration) {
+		t.Helper()
+		if _, err := client.Resource(kustomizations).Namespace(FluxNamespace).Update(t.Context(), kustomizationAt(status, message, start.Add(at)), metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForFailure := func(message string) *rollout.Episode {
+		t.Helper()
+		var episode *rollout.Episode
+		waitFor(t, "failure "+message, func() bool {
+			episode = watcher.Observe(env).Kustomization.NotReady
+			return episode != nil && episode.Failure != nil && episode.Failure.Message == message
+		})
+		return episode
+	}
+
+	if episode := watcher.Observe(env).Kustomization.NotReady; episode != nil {
+		t.Fatalf("Ready=True has episode %+v", episode)
+	}
+
+	// Each change carries a newer lastTransitionTime, but the episode keeps the
+	// first start: Unknown between attempts must not restart the wait.
+	update("False", "attempt 1", 0)
+	waitForFailure("attempt 1")
+	update("Unknown", "in progress", time.Minute)
+	update("False", "attempt 2", 11*time.Minute)
+	episode := waitForFailure("attempt 2")
+
+	if !episode.Since.Equal(start) {
+		t.Errorf("Since = %v, want %v", episode.Since, start)
+	}
+
+	status := rollout.Evaluate(rollout.Observation{Kustomization: rollout.Object{Kind: "Kustomization", Namespace: FluxNamespace, Name: "fisioindoor", Found: true, NotReady: episode}, Target: "v1.0.3"}, start.Add(11*time.Minute))
+	if status.Phase != rollout.PhaseFailed || status.Reason == nil {
+		t.Errorf("status = %+v, want failed with a reason", status)
+	}
+
+	update("True", "ready", 12*time.Minute)
+	waitFor(t, "True to clear the episode", func() bool {
+		return watcher.Observe(env).Kustomization.NotReady == nil
+	})
+
+	// A later failure starts a new episode.
+	update("False", "attempt 3", 13*time.Minute)
+	if episode := waitForFailure("attempt 3"); !episode.Since.Equal(start.Add(13 * time.Minute)) {
+		t.Errorf("Since = %v, want a new start", episode.Since)
+	}
+
+	if err := client.Resource(kustomizations).Namespace(FluxNamespace).Delete(t.Context(), "fisioindoor", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "deletion to forget the episode", func() bool {
+		return watcher.episode(kustomizations, FluxNamespace, "fisioindoor") == nil
+	})
+}
+
+func TestEpisodeSeededFromTheClusterAfterARestart(t *testing.T) {
+	start := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cfg := parseConfig(t)
+	env, _ := cfg.Find("fisioindoor", "production")
+
+	// A new process finds the object already failing.
+	watcher := startSynced(t, newClient(kustomizationAt("False", "broken", start.Add(-20*time.Minute))), cfg)
+
+	episode := watcher.Observe(env).Kustomization.NotReady
+	if episode == nil || !episode.Since.Equal(start.Add(-20*time.Minute)) {
+		t.Fatalf("episode = %+v, want one seeded from lastTransitionTime", episode)
+	}
+	if episode.Failure == nil {
+		t.Error("the seeded episode lost its Ready=False")
+	}
+}
+
+type testClock struct{ nanos atomic.Int64 }
+
+func newTestClock(at time.Time) *testClock {
+	clock := &testClock{}
+	clock.nanos.Store(at.UnixNano())
+	return clock
+}
+
+func (c *testClock) now() time.Time { return time.Unix(0, c.nanos.Load()) }
+
+func (c *testClock) advance(d time.Duration) { c.nanos.Add(int64(d)) }
+
+func TestWatchFailingWindow(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC))
+	watcher := New(newClient(), parseConfig(t), clock.now, discardLogger)
+
+	if watcher.WatchFailing() {
+		t.Fatal("WatchFailing before any error")
+	}
+
+	watcher.recordWatchError(deployments, "fisioindoor", errors.New("forbidden"))
+	if !watcher.WatchFailing() {
+		t.Fatal("WatchFailing = false right after an error")
+	}
+
+	clock.advance(2*time.Minute - time.Second)
+	if !watcher.WatchFailing() {
+		t.Error("WatchFailing = false just under two minutes after the error")
+	}
+	clock.advance(time.Second)
+	if watcher.WatchFailing() {
+		t.Error("WatchFailing = true two minutes after the last error")
+	}
+
+	// An error that keeps occurring keeps it failing.
+	watcher.recordWatchError(deployments, "fisioindoor", errors.New("forbidden"))
+	if !watcher.WatchFailing() {
+		t.Error("WatchFailing = false after a new error")
+	}
+}
+
+func TestRoutineWatchClosesDoNotCount(t *testing.T) {
+	watcher := New(newClient(), parseConfig(t), time.Now, discardLogger)
+
+	for _, err := range []error{
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		apierrors.NewResourceExpired("too old"),
+		&apierrors.StatusError{ErrStatus: metav1.Status{Code: http.StatusGone, Reason: metav1.StatusReasonGone}},
+	} {
+		watcher.recordWatchError(deployments, "fisioindoor", err)
+		if watcher.WatchFailing() {
+			t.Errorf("%v counted as a watch failure", err)
+		}
+	}
+}
+
+func TestReadinessFailsWhenAWatchBreaksAfterSync(t *testing.T) {
+	cfg := parseConfig(t)
+	client := newClient()
+	// RBAC, say, is removed after the first list.
+	client.PrependWatchReactor("deployments", func(k8stesting.Action) (bool, apiwatch.Interface, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, "", errors.New("no access"))
+	})
+
+	watcher := New(client, cfg, time.Now, discardLogger)
+	watcher.Start(t.Context())
+	waitFor(t, "first sync", watcher.Synced)
+	waitFor(t, "the watch error", watcher.WatchFailing)
+
+	h := server.New(cfg, watcher, time.Now, discardLogger)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/readyz", http.NoBody))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Errorf("/readyz = %d: %s, want 503", recorder.Code, recorder.Body)
 	}
 }

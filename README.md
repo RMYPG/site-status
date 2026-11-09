@@ -62,7 +62,9 @@ The service authenticates only with its pod's ServiceAccount token, and uses onl
 `get`, `list` and `watch`. It watches each configured namespace separately and
 never lists or watches across the cluster, because its permissions are granted
 per namespace. Anything less than the table below keeps it unready: the first
-list fails and is retried, and `/readyz` answers `503` until it succeeds.
+list fails and is retried, and `/readyz` answers `503` until it succeeds. A watch
+that breaks later is logged and fails `/readyz` while the errors continue, so the
+pod stops serving from a cache that has stopped following the cluster.
 
 | Resources | Where |
 | --- | --- |
