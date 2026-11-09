@@ -92,6 +92,7 @@ func TestParseRejects(t *testing.T) {
 		{"duplicate key differing in case", strings.Replace(validConfig, `"id": "fisioindoor"`, `"id": "fisioindoor", "ID": "other"`, 1), "duplicate key"},
 		{"duplicate Site", doc(site("a", "production", good), site("a", "staging", envBody("b", "b-sws"))), `duplicate Site "a"`},
 		{"two environments share a Deployment", doc(site("a", "production", good), site("b", "production", strings.Replace(envBody("b", "b-sws"), `"namespace":"b","deployment":"b-sws"`, `"namespace":"a","deployment":"a-sws"`, 1))), "Deployment a/a-sws is also used by"},
+		{"two environments share a HelmRelease", doc(site("a", "production", good), site("b", "production", strings.Replace(envBody("b", "b-sws"), `"namespace":"b","deployment":"b-sws","helmRelease":"b"`, `"namespace":"a","deployment":"b-sws","helmRelease":"a"`, 1))), "HelmRelease a/a is also used by"},
 		{"two environments share an ImagePolicy", doc(site("a", "production", good), site("b", "production", strings.Replace(envBody("b", "b-sws"), `b-production`, `a-production`, 1))), "ImagePolicy a-production is also used by"},
 		{"no sites", `{"imageUpdateAutomation":"image-tags","sites":[]}`, "at least one Site"},
 		{"no automation", `{"sites":[` + site("a", "production", good) + `]}`, "imageUpdateAutomation"},

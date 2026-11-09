@@ -241,17 +241,24 @@ func TestNotFoundBeforeSync(t *testing.T) {
 func TestMethodNotAllowed(t *testing.T) {
 	h := handler(t, &fakeSource{synced: true})
 
-	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/sites/fisioindoor/environments/production", http.NoBody))
+	for _, path := range []string{
+		"/v1/sites/fisioindoor/environments/production",
+		"/v1/sites/fisioindoor/environments/production/rollouts",
+	} {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, http.NoBody))
 
-	if recorder.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", recorder.Code)
+			if recorder.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405", recorder.Code)
+			}
+			if recorder.Header().Get("Allow") != "GET, HEAD" {
+				t.Errorf("Allow = %q", recorder.Header().Get("Allow"))
+			}
+			assertHeaders(t, recorder)
+			assertError(t, recorder)
+		})
 	}
-	if recorder.Header().Get("Allow") != "GET, HEAD" {
-		t.Errorf("Allow = %q", recorder.Header().Get("Allow"))
-	}
-	assertHeaders(t, recorder)
-	assertError(t, recorder)
 }
 
 func TestReadinessBeforeSync(t *testing.T) {

@@ -74,6 +74,10 @@ func TestServeShutsDownGracefully(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		}),
 	}
+	// Only Shutdown runs this, so Close would fail the wait for it below.
+	shuttingDown := make(chan struct{})
+	httpServer.RegisterOnShutdown(func() { close(shuttingDown) })
+
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -109,8 +113,14 @@ func TestServeShutsDownGracefully(t *testing.T) {
 		t.Fatal("request never reached the handler")
 	}
 
-	// A signal arrives while the request is in flight.
+	// A signal arrives while the request is in flight, which finishes only once
+	// the shutdown has begun.
 	cancel()
+	select {
+	case <-shuttingDown:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not shut down gracefully")
+	}
 	close(release)
 
 	select {
