@@ -57,6 +57,12 @@ the service can only seed it from a `lastTransitionTime` that Flux has probably
 just rewritten, so a Site that was already `failed` may report `deploying` again
 for up to 10 minutes.
 
+One accepted limit: the stretch is followed through events that can lag a moment
+behind the service's cache. If `Ready` goes `False`, `True`, `False` inside that
+lag, the earlier stretch carries on, so a waiting Site can report `failed` before
+a fresh 10 minutes have passed. The object really is failing at that moment, so
+the only effect is reporting it early.
+
 `Released=False` and `ProgressDeadlineExceeded` have no grace period and are not
 cleared by a new `target`. They stay until a rollout succeeds, so when a Site's
 earlier rollout has failed, the next `target` reports `failed` right away, and
@@ -125,7 +131,7 @@ These limits follow from reading ReplicaSets and storing nothing:
 | `200` | The answer above. | Use it. |
 | `404` | The Site or environment isn't configured, or the path doesn't exist. | Fix the configuration or the request. |
 | `405` | A method other than `GET` or `HEAD`. | Use `GET`. |
-| `503` | The watches have not finished their first sync, or a watch failed within the last 2 minutes, so an answer could be stale. | Treat it as no answer and ask again. |
+| `503` | The watches have not finished their first sync, or a watch or the periodic check of the API server failed within the last 2 minutes, so an answer could be stale. | Treat it as no answer and ask again. |
 
 A `404` or `503`, like a connection failure, says nothing about the rollout. It
 must not make a Publish `failed`.
@@ -137,8 +143,11 @@ Error bodies are `{ "error": "message" }`.
 | Path | Answers |
 | --- | --- |
 | `GET /healthz` | Always `200 {"status":"ok"}`. |
-| `GET /readyz` | `503 {"status":"syncing"}` until every watch has completed its first sync. After that, `503 {"status":"watch failing"}` while watches keep failing (the last failure was under 2 minutes ago), and otherwise `200 {"status":"ok"}`. |
+| `GET /readyz` | `503 {"status":"syncing"}` until every watch has completed its first sync. After that, `503 {"status":"watch failing"}` while reads keep failing (the last failure was under 2 minutes ago), and otherwise `200 {"status":"ok"}`. |
 
-A watch failure here is one client-go reports, such as Forbidden or a timeout.
-client-go retries `connection refused` and 429 when opening a watch without
-reporting them, so those two don't count. `GET /healthz` is unaffected by either.
+A failure here is a watch error client-go reports, such as Forbidden, or a failure
+of the service's own check: every 30 seconds it lists Deployments in one configured
+namespace, with a limit of 1 and a 10-second timeout. The check is needed because
+client-go hides many failures while opening a watch: it retries `connection refused`
+and 429, and turns a timeout, connection reset or GOAWAY into an empty watch. A list
+returns all of those as errors. `GET /healthz` is unaffected.

@@ -64,12 +64,15 @@ never lists or watches across the cluster, because its permissions are granted
 per namespace. Anything less than the table below keeps it unready: the first
 list fails and is retried, and `/readyz` answers `503` until it succeeds.
 
-A watch that fails later with an error client-go reports, such as Forbidden or a
-timeout, is logged, and `/readyz` and the API answer `503` while those errors
-continue, so the pod stops serving from a cache that has stopped following the
-cluster. client-go retries `connection refused` and 429 when opening a watch
-without reporting them, so those two don't fail `/readyz`: the service keeps
-answering from its cache until the API server is back.
+After the first sync, the service also has to notice when its cache stops
+following the cluster. It reads two things: the errors client-go reports from
+watches, such as Forbidden, and a check of its own, a `list` of Deployments in one
+configured namespace every 30 seconds, with a limit of 1 and a 10-second timeout
+(no extra RBAC). The check is needed because client-go hides many failures while
+opening a watch: it retries `connection refused` and 429, and turns a timeout,
+connection reset or GOAWAY into an empty watch, so a network block would otherwise
+go unseen. Any failure of either is logged, and `/readyz` and the API answer `503`
+until 2 minutes after the last one.
 
 | Resources | Where |
 | --- | --- |

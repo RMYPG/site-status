@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 const testConfig = `{
@@ -791,6 +793,187 @@ func TestNotSyncedWhileEventHandlersCatchUp(t *testing.T) {
 	waitFor(t, "the event handler", watcher.Synced)
 	if episode := watcher.Observe(env).Kustomization.NotReady; episode == nil || !episode.Since.Equal(created) {
 		t.Errorf("episode = %+v, want one seeded from the initial list", episode)
+	}
+}
+
+func TestWrappedEOFCounts(t *testing.T) {
+	// A failed list reports EOF wrapped in its request; only a bare EOF is the
+	// server ending a watch.
+	watcher := New(newClient(), parseConfig(t), time.Now, discardLogger)
+
+	watcher.recordWatchError(deployments, "fisioindoor", fmt.Errorf("Get https://10.96.0.1/apis: %w", io.EOF))
+
+	if !watcher.WatchFailing() {
+		t.Error("a wrapped EOF did not count as a failure")
+	}
+}
+
+func TestObserveReadsTheRevision(t *testing.T) {
+	created := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	cfg := parseConfig(t)
+	env, _ := cfg.Find("fisioindoor", "production")
+
+	deployment := object("apps/v1", "Deployment", "fisioindoor", "fisioindoor-sws")
+	deployment.SetUID("deployment-uid")
+	rs := replicaSet("fisioindoor", "fisioindoor-sws-a", "ghcr.io/rmypg/fisioindoor:v1.0.2", "deployment-uid", created, 1)
+	rs.SetAnnotations(map[string]string{revisionAnnotation: "7"})
+
+	got := startSynced(t, newClient(deployment, rs), cfg).Observe(env).ReplicaSets
+	if len(got) != 1 || got[0].Revision != 7 {
+		t.Errorf("ReplicaSets = %+v, want revision 7", got)
+	}
+}
+
+func TestForgetEpisodeUnwrapsATombstone(t *testing.T) {
+	watcher := New(newClient(), parseConfig(t), time.Now, discardLogger)
+	item := kustomizationAt("False", "broken", time.Now())
+
+	watcher.trackEpisode(kustomizations, item)
+	if watcher.episode(kustomizations, FluxNamespace, "fisioindoor") == nil {
+		t.Fatal("no episode to forget")
+	}
+
+	watcher.forgetEpisode(kustomizations, cache.DeletedFinalStateUnknown{Key: FluxNamespace + "/fisioindoor", Obj: item})
+
+	if got := watcher.episode(kustomizations, FluxNamespace, "fisioindoor"); got != nil {
+		t.Errorf("episode = %+v, want it forgotten", got)
+	}
+}
+
+func isProbe(action k8stesting.Action) bool {
+	list, ok := action.(interface{ GetListOptions() metav1.ListOptions })
+	return ok && action.GetVerb() == "list" && action.GetResource() == deployments && list.GetListOptions().Limit == 1
+}
+
+func countProbes(client *dynamicfake.FakeDynamicClient) int {
+	count := 0
+	for _, action := range client.Actions() {
+		if isProbe(action) {
+			count++
+		}
+	}
+	return count
+}
+
+func TestProbeIsNamespacedAndOnlyLists(t *testing.T) {
+	client := newClient()
+	watcher := New(client, parseConfig(t), time.Now, discardLogger)
+
+	watcher.probe(t.Context())
+
+	actions := client.Actions()
+	if len(actions) != 1 {
+		t.Fatalf("actions = %v, want one list", actions)
+	}
+	if !isProbe(actions[0]) {
+		t.Errorf("action = %+v, want a list of Deployments with limit 1", actions[0])
+	}
+	if got := actions[0].GetNamespace(); got != "fisioindoor" {
+		t.Errorf("namespace = %q, want the first configured namespace", got)
+	}
+	if watcher.WatchFailing() {
+		t.Error("a successful probe counted as a failure")
+	}
+}
+
+func TestFailingProbeFailsTheServiceUntilItLapses(t *testing.T) {
+	cfg := parseConfig(t)
+	clock := newTestClock(time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC))
+	client := newClient()
+	var failing atomic.Bool
+	client.PrependReactor("list", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if failing.Load() && isProbe(action) {
+			return true, nil, errors.New("dial tcp 10.96.0.1:443: i/o timeout")
+		}
+		return false, nil, nil
+	})
+
+	watcher := New(client, cfg, clock.now, discardLogger)
+	h := server.New(cfg, watcher, clock.now, discardLogger)
+	watcher.Start(t.Context())
+	waitFor(t, "first sync", watcher.Synced)
+	assertAnswering(t, h, http.StatusOK)
+
+	failing.Store(true)
+	watcher.probe(t.Context())
+	if !watcher.WatchFailing() {
+		t.Fatal("WatchFailing = false after a failed probe")
+	}
+	assertAnswering(t, h, http.StatusServiceUnavailable)
+
+	// A probe that succeeds doesn't end the window early.
+	failing.Store(false)
+	watcher.probe(t.Context())
+	assertAnswering(t, h, http.StatusServiceUnavailable)
+
+	clock.advance(2 * time.Minute)
+	assertAnswering(t, h, http.StatusOK)
+}
+
+func TestProbeIsBoundedByItsTimeout(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	client := &blockingListClient{Interface: newClient(), resource: deployments, namespace: "fisioindoor", release: release}
+	watcher := New(client, parseConfig(t), time.Now, discardLogger)
+	watcher.probeTimeout = time.Millisecond
+
+	watcher.probe(t.Context())
+
+	if !watcher.WatchFailing() {
+		t.Error("a probe that timed out did not count as a failure")
+	}
+}
+
+func TestProbeCancelledByShutdownIsNotAFailure(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	client := &blockingListClient{Interface: newClient(), resource: deployments, namespace: "fisioindoor", release: release}
+	watcher := New(client, parseConfig(t), time.Now, discardLogger)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	watcher.probe(ctx)
+
+	if watcher.WatchFailing() {
+		t.Error("a probe cancelled by shutdown counted as a failure")
+	}
+}
+
+func TestStartRunsTheProbeOnItsSchedule(t *testing.T) {
+	client := newClient()
+	watcher := New(client, parseConfig(t), time.Now, discardLogger)
+	watcher.probeEvery = time.Millisecond
+
+	watcher.Start(t.Context())
+
+	waitFor(t, "more than one probe", func() bool { return countProbes(client) >= 2 })
+	for _, action := range client.Actions() {
+		if action.GetNamespace() == "" {
+			t.Errorf("cluster-scoped %s on %s", action.GetVerb(), action.GetResource().Resource)
+		}
+	}
+}
+
+func TestProbeLoopStopsWithItsContext(t *testing.T) {
+	client := newClient()
+	watcher := New(client, parseConfig(t), time.Now, discardLogger)
+	watcher.probeEvery = time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stopped := make(chan struct{})
+	go func() {
+		watcher.probeLoop(ctx)
+		close(stopped)
+	}()
+	waitFor(t, "a probe", func() bool { return countProbes(client) >= 1 })
+
+	cancel()
+
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe loop did not stop with its context")
 	}
 }
 

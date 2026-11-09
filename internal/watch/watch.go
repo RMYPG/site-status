@@ -6,7 +6,6 @@ package watch
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log/slog"
 	"strconv"
@@ -36,12 +35,14 @@ const (
 	// The rules look at the clock on every request, so nothing needs a periodic
 	// resync: a watch event is the only reason an object changes.
 	noResync = time.Duration(0)
-	// watchErrorWindow is how long one reported watch failure keeps the service
-	// unready. The reflector's retries back off to between 30 and 60 seconds, so
-	// a watch that keeps failing renews it and one that has recovered lets it
-	// lapse. client-go retries connection refused and 429 when opening a watch
-	// without calling the error handler, so those two don't count.
+	// watchErrorWindow is how long one failure keeps the service unready. A cause
+	// that persists renews it, and one that has recovered lets it lapse: the
+	// reflector's retries back off to between 30 and 60 seconds, and the probe
+	// repeats every defaultProbeInterval.
 	watchErrorWindow = 2 * time.Minute
+	// The probe is one small namespaced list with the service's existing RBAC.
+	defaultProbeInterval = 30 * time.Second
+	defaultProbeTimeout  = 10 * time.Second
 )
 
 // The resources the service reads. The dynamic client reads them as
@@ -88,6 +89,11 @@ type Watcher struct {
 	// track handles one informer event. Tests wrap it to delay the handler.
 	track func(schema.GroupVersionResource, any)
 
+	client         dynamic.Interface
+	probeNamespace string
+	probeEvery     time.Duration
+	probeTimeout   time.Duration
+
 	episodesMu sync.RWMutex
 	episodes   map[episodeKey]*rollout.Episode
 
@@ -103,6 +109,10 @@ func New(client dynamic.Interface, cfg *config.Config, now func() time.Time, log
 		now:        now,
 		log:        log,
 		episodes:   map[episodeKey]*rollout.Episode{},
+
+		client:       client,
+		probeEvery:   defaultProbeInterval,
+		probeTimeout: defaultProbeTimeout,
 	}
 	w.track = w.trackEpisode
 
@@ -114,6 +124,9 @@ func New(client dynamic.Interface, cfg *config.Config, now func() time.Time, log
 				continue
 			}
 			seen[env.Namespace] = true
+			if w.probeNamespace == "" || env.Namespace < w.probeNamespace {
+				w.probeNamespace = env.Namespace
+			}
 			w.addNamespace(client, env.Namespace, deployments, replicaSets, helmReleases)
 		}
 	}
@@ -148,6 +161,35 @@ func (w *Watcher) Start(ctx context.Context) {
 	for _, factory := range w.factories {
 		factory.Start(ctx.Done())
 	}
+	go w.probeLoop(ctx)
+}
+
+// probeLoop checks the API server on a schedule, until ctx ends. The watches
+// can't be relied on for this: when opening a watch, client-go retries
+// connection refused and 429, and turns a timeout, reset, GOAWAY or EOF into an
+// empty watch, so the error handler never hears of them.
+func (w *Watcher) probeLoop(ctx context.Context) {
+	ticker := time.NewTicker(w.probeEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.probe(ctx)
+		}
+	}
+}
+
+// probe makes one bounded list, which reports as an error every failure the
+// watches hide. A list cancelled by shutdown isn't a failure.
+func (w *Watcher) probe(ctx context.Context) {
+	probeCtx, cancel := context.WithTimeout(ctx, w.probeTimeout)
+	defer cancel()
+	_, err := w.client.Resource(deployments).Namespace(w.probeNamespace).List(probeCtx, metav1.ListOptions{Limit: 1})
+	if err != nil && ctx.Err() == nil {
+		w.recordWatchError(deployments, w.probeNamespace, err)
+	}
 }
 
 // Synced reports whether every watch has completed its first list, and the
@@ -166,7 +208,7 @@ func (w *Watcher) Synced() bool {
 	return true
 }
 
-// WatchFailing reports whether client-go reported a watch failure within
+// WatchFailing reports whether a watch or the probe failed within
 // watchErrorWindow, which means the caches may have stopped following the
 // cluster.
 func (w *Watcher) WatchFailing() bool {
@@ -174,11 +216,12 @@ func (w *Watcher) WatchFailing() bool {
 	return last != 0 && w.now().Sub(time.Unix(0, last)) < watchErrorWindow
 }
 
-// recordWatchError logs a broken watch and notes when it happened. The routine
-// ends of a watch are left out, as in client-go's default handler: the server
-// closes watches regularly and the reflector just opens another.
+// recordWatchError logs a failed watch or probe and notes when it happened. The
+// routine ends of a watch are left out, as in client-go's default handler: the
+// server closes watches regularly and the reflector just opens another.
 func (w *Watcher) recordWatchError(resource schema.GroupVersionResource, namespace string, err error) {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
+	//nolint:errorlint // As client-go's handler does: a wrapped EOF is a failed request, not a routine close.
+	if err == io.EOF || err == io.ErrUnexpectedEOF || apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
 		return
 	}
 	w.lastWatchError.Store(w.now().UnixNano())
