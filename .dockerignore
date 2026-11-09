@@ -1,0 +1,7 @@
+# Only the module's sources reach the build; tests stay out.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/
+**/*_test.go

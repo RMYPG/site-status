@@ -1,0 +1,28 @@
+[tools]
+# Keep in step with the Dockerfile's build image.
+go = "1.27.2"
+golangci-lint = "2.15.0"
+jactionlint = "2.3.0"
+# jactionlint checks workflow scripts with it.
+shellcheck = "0.11.0"
+
+[env]
+# Only the toolchain above: go.mod must not pull another one in.
+GOTOOLCHAIN = "local"
+
+[tasks.lint]
+description = "Lint the Go code, the GitHub workflows and the scripts"
+run = [
+  "go mod tidy -diff",
+  "golangci-lint run",
+  "jactionlint",
+  "shellcheck scripts/*.sh",
+]
+
+[tasks.test]
+description = "Run the tests with the race detector"
+run = "go test -race -count=1 ./..."
+
+[tasks.ci]
+description = "Run the linters and the tests, as CI does before building the image"
+depends = ["lint", "test"]
