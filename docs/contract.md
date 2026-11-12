@@ -100,7 +100,10 @@ are still known and equal:
   single-replica Site, not a failure.
 
 **For a consumer comparing versions:** treat a `null` `target` or `running` as
-older than every version. Ticket 33's rules then apply unchanged.
+older than every version. Ticket 33's rules then apply, except its 60-minute
+rule, which applies only while `running` is a known version. A `null` `running`
+means no Pod is available, an outage the platform alerts on itself rather than a
+failed Publish. A rollout that can't start still reports `phase: failed`.
 
 ## `GET /v1/sites/{site}/environments/{environment}/rollouts`
 
